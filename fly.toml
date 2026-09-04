@@ -1,0 +1,41 @@
+# Fly.io service definition for atlas-detector.
+#
+# Runs in the same organisation as the `live-video` MediaMTX app, so it reaches
+# the media server over the private 6PN network at live-video.internal:8554
+# (RTSP is not exposed publicly).
+#
+# Deploy manually from this directory:
+#   fly deploy
+#
+# Required secrets:
+#   fly secrets set MEDIAMTX_RTSP_URL=... SUPABASE_URL=... \
+#     SUPABASE_SERVICE_ROLE_KEY=... FLIGHT_SESSION_ID=...
+
+app = "atlas-detector"
+primary_region = "ams"
+
+[build]
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "60s"
+    interval = "30s"
+    method = "GET"
+    timeout = "5s"
+    path = "/health"
+
+[env]
+  DETECTION_FPS = "5"
+  DETECTION_CLASSES = "person,car,truck,bus,motorcycle,boat"
+  DETECTION_CONFIDENCE = "0.35"
+  TRACK_TTL_SECONDS = "3"
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "2048mb"
