@@ -841,7 +841,7 @@ def run_stream(detector, store: DetectionStore) -> None:
     tracker = sv.ByteTrack(
         lost_track_buffer=TRACKER_LOST_BUFFER,
         frame_rate=max(1, int(round(ANALYSIS_FPS))),
-        track_activation_threshold=min(0.25, DETECTION_CONFIDENCE),
+        track_activation_threshold=min(0.25, DETECTION_BOX_THRESHOLD if DETECTION_ENGINE == "grounding_dino" else DETECTION_CONFIDENCE),
     )
     grabber = FrameGrabber(cap)
     last_seq = 0
