@@ -1,20 +1,26 @@
 """atlas-detector — continuous object detection and tracking on Atlas drone video.
 
-Reads one MediaMTX stream over RTSP, runs YOLOv8n + ByteTrack on a subset of the
-frames, and upserts one row per tracked object into the Supabase table
-`atlas_detections` (unique on flight_session_id + track_id). A cleanup loop
-deletes tracks that stopped being updated.
+Reads one MediaMTX stream over RTSP, runs a detector (YOLOv8n by default, or
+Grounding DINO for open-vocabulary text-prompted detection) plus ByteTrack on a
+subset of the frames, and upserts one row per tracked object into the Supabase
+table `atlas_detections` (unique on flight_session_id + track_id). A cleanup
+loop deletes tracks that stopped being updated.
 
 CPU only. Everything is configured through environment variables:
 
-  MEDIAMTX_RTSP_URL          rtsp://live-video.internal:8554/<serial>/<sensor>?detector=<secret>
+  MEDIAMTX_RTSP_URL             rtsp://live-video.internal:8554/<serial>/<sensor>?detector=<secret>
   SUPABASE_URL
   SUPABASE_SERVICE_ROLE_KEY
-  FLIGHT_SESSION_ID          active_flights.id the detections belong to
-  DETECTION_FPS              analysis rate, default 5
-  DETECTION_CLASSES          default person,car,truck,bus,motorcycle,boat
-  DETECTION_CONFIDENCE       default 0.35
-  TRACK_TTL_SECONDS          default 3
+  FLIGHT_SESSION_ID             active_flights.id the detections belong to
+  DETECTION_ENGINE              yolo (default) | grounding_dino
+  DETECTION_FPS                 analysis rate for yolo, default 5
+  DETECTION_FPS_GROUNDING_DINO  analysis rate for grounding_dino, default 0.2
+  DETECTION_CLASSES             yolo only, default person,car,truck,bus,motorcycle,boat
+  DETECTION_CONFIDENCE          yolo only, default 0.35
+  DETECTION_TEXT_PROMPT         grounding_dino only, "person . car . boat . ..."
+  DETECTION_BOX_THRESHOLD       grounding_dino only, default 0.25
+  DETECTION_TEXT_THRESHOLD      grounding_dino only, default 0.20
+  TRACK_TTL_SECONDS             default 3
 """
 
 from __future__ import annotations
@@ -31,7 +37,6 @@ import cv2
 import numpy as np
 import supervision as sv
 from supabase import create_client
-from ultralytics import YOLO
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,7 +53,12 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 FLIGHT_SESSION_ID = os.environ.get("FLIGHT_SESSION_ID", "").strip()
 
+DETECTION_ENGINE = (os.environ.get("DETECTION_ENGINE", "yolo") or "yolo").strip().lower()
+
 DETECTION_FPS = float(os.environ.get("DETECTION_FPS", "5") or 5)
+DETECTION_FPS_GROUNDING_DINO = float(
+    os.environ.get("DETECTION_FPS_GROUNDING_DINO", "0.2") or 0.2
+)
 DETECTION_CONFIDENCE = float(os.environ.get("DETECTION_CONFIDENCE", "0.35") or 0.35)
 TRACK_TTL_SECONDS = float(os.environ.get("TRACK_TTL_SECONDS", "3") or 3)
 DETECTION_CLASSES = [
@@ -59,7 +69,20 @@ DETECTION_CLASSES = [
     if c.strip()
 ]
 
+# Grounding DINO expects categories separated by " . ".
+DETECTION_TEXT_PROMPT = (
+    os.environ.get(
+        "DETECTION_TEXT_PROMPT", "person . car . boat . truck . bus . motorcycle"
+    ).strip()
+    or "person . car . boat . truck . bus . motorcycle"
+)
+DETECTION_BOX_THRESHOLD = float(os.environ.get("DETECTION_BOX_THRESHOLD", "0.25") or 0.25)
+DETECTION_TEXT_THRESHOLD = float(os.environ.get("DETECTION_TEXT_THRESHOLD", "0.20") or 0.20)
+
 MODEL_PATH = os.environ.get("MODEL_PATH", "yolov8n.pt")
+GROUNDING_DINO_CHECKPOINT = os.environ.get(
+    "GROUNDING_DINO_CHECKPOINT", "IDEA-Research/grounding-dino-tiny"
+)
 
 # Backoff bounds for reconnecting to MediaMTX.
 BACKOFF_MIN = 1.0
@@ -68,7 +91,10 @@ BACKOFF_MAX = 30.0
 # Force TCP for RTSP — UDP is unreliable across the Fly private network.
 os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
 
-MIN_FRAME_INTERVAL = 1.0 / DETECTION_FPS if DETECTION_FPS > 0 else 0.2
+ANALYSIS_FPS = (
+    DETECTION_FPS_GROUNDING_DINO if DETECTION_ENGINE == "grounding_dino" else DETECTION_FPS
+)
+MIN_FRAME_INTERVAL = 1.0 / ANALYSIS_FPS if ANALYSIS_FPS > 0 else 0.2
 
 
 # --------------------------------------------------------------------------- #
@@ -97,8 +123,12 @@ class Status:
                 "reconnects": self.reconnects,
                 "uptime_seconds": round(time.time() - self.started_at, 1),
                 "flight_session_id": FLIGHT_SESSION_ID or None,
-                "detection_fps": DETECTION_FPS,
+                "engine": DETECTION_ENGINE,
+                "detection_fps": ANALYSIS_FPS,
                 "classes": DETECTION_CLASSES,
+                "text_prompt": (
+                    DETECTION_TEXT_PROMPT if DETECTION_ENGINE == "grounding_dino" else None
+                ),
             }
 
 
@@ -126,6 +156,121 @@ def start_health_server() -> None:
     server = ThreadingHTTPServer(("0.0.0.0", 8080), HealthHandler)
     threading.Thread(target=server.serve_forever, daemon=True, name="health").start()
     log.info("Health server listening on :8080")
+
+
+# --------------------------------------------------------------------------- #
+# Detectors — both return (sv.Detections, list[str] labels aligned by index)
+# --------------------------------------------------------------------------- #
+
+
+class YoloDetector:
+    """YOLOv8n with a fixed COCO class list. Unchanged default behaviour."""
+
+    name = "yolo"
+
+    def __init__(self) -> None:
+        from ultralytics import YOLO
+
+        log.info("Loading YOLOv8n (%s)", MODEL_PATH)
+        self.model = YOLO(MODEL_PATH)
+
+        names: dict[int, str] = {int(k): str(v).lower() for k, v in self.model.names.items()}
+        self.class_ids = {cid: n for cid, n in names.items() if n in DETECTION_CLASSES}
+        unknown = set(DETECTION_CLASSES) - set(self.class_ids.values())
+        if unknown:
+            log.warning("Unknown classes ignored: %s", ", ".join(sorted(unknown)))
+        if not self.class_ids:
+            raise SystemExit("No valid classes in DETECTION_CLASSES")
+
+    def describe(self) -> str:
+        return (
+            f"engine=yolo model={MODEL_PATH} "
+            f"classes={','.join(sorted(self.class_ids.values()))} "
+            f"confidence={DETECTION_CONFIDENCE} fps={ANALYSIS_FPS}"
+        )
+
+    def detect(self, frame) -> tuple[sv.Detections, list[str]]:
+        result = self.model.predict(
+            frame,
+            conf=DETECTION_CONFIDENCE,
+            classes=sorted(self.class_ids.keys()),
+            verbose=False,
+        )[0]
+        detections = sv.Detections.from_ultralytics(result)
+        class_ids = (
+            detections.class_id
+            if detections.class_id is not None
+            else np.full(len(detections), -1)
+        )
+        labels = [self.class_ids.get(int(cid), "") for cid in class_ids]
+        return detections, labels
+
+
+class GroundingDinoDetector:
+    """Open-vocabulary detection driven by a free-text prompt (CPU, Swin-T)."""
+
+    name = "grounding_dino"
+
+    def __init__(self) -> None:
+        import torch
+        from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+
+        self.torch = torch
+        log.info("Loading Grounding DINO (%s)", GROUNDING_DINO_CHECKPOINT)
+        self.processor = AutoProcessor.from_pretrained(GROUNDING_DINO_CHECKPOINT)
+        self.model = AutoModelForZeroShotObjectDetection.from_pretrained(
+            GROUNDING_DINO_CHECKPOINT
+        )
+        self.model.eval()
+        # Grounding DINO wants lowercase categories ending with a period.
+        prompt = DETECTION_TEXT_PROMPT.strip().lower()
+        self.prompt = prompt if prompt.endswith(".") else prompt + " ."
+
+    def describe(self) -> str:
+        return (
+            f"engine=grounding_dino checkpoint={GROUNDING_DINO_CHECKPOINT} "
+            f"prompt=\"{self.prompt}\" box_threshold={DETECTION_BOX_THRESHOLD} "
+            f"text_threshold={DETECTION_TEXT_THRESHOLD} fps={ANALYSIS_FPS}"
+        )
+
+    def detect(self, frame) -> tuple[sv.Detections, list[str]]:
+        height, width = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        inputs = self.processor(images=rgb, text=self.prompt, return_tensors="pt")
+        with self.torch.no_grad():
+            outputs = self.model(**inputs)
+
+        results = self.processor.post_process_grounded_object_detection(
+            outputs,
+            inputs.input_ids,
+            threshold=DETECTION_BOX_THRESHOLD,
+            text_threshold=DETECTION_TEXT_THRESHOLD,
+            target_sizes=[(height, width)],
+        )[0]
+
+        boxes = results["boxes"].cpu().numpy().astype(np.float32)
+        scores = results["scores"].cpu().numpy().astype(np.float32)
+        labels = [str(t).strip().lower() for t in results.get("text_labels", results["labels"])]
+
+        if len(boxes) == 0:
+            return sv.Detections.empty(), []
+
+        detections = sv.Detections(
+            xyxy=boxes.reshape(-1, 4),
+            confidence=scores,
+            class_id=np.zeros(len(boxes), dtype=int),
+        )
+        return detections, labels
+
+
+def build_detector():
+    if DETECTION_ENGINE == "yolo":
+        return YoloDetector()
+    if DETECTION_ENGINE == "grounding_dino":
+        return GroundingDinoDetector()
+    raise SystemExit(
+        f"Unknown DETECTION_ENGINE '{DETECTION_ENGINE}' — use 'yolo' or 'grounding_dino'"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -174,7 +319,7 @@ def cleanup_loop(store: DetectionStore) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Detection
+# Detection loop
 # --------------------------------------------------------------------------- #
 
 
@@ -191,7 +336,7 @@ def open_capture(url: str) -> cv2.VideoCapture | None:
     return cap
 
 
-def run_stream(model: YOLO, class_ids: dict[int, str], store: DetectionStore) -> None:
+def run_stream(detector, store: DetectionStore) -> None:
     """One connection attempt. Returns when the stream drops."""
     cap = open_capture(RTSP_URL)
     if cap is None:
@@ -202,7 +347,6 @@ def run_stream(model: YOLO, class_ids: dict[int, str], store: DetectionStore) ->
     log.info("Connected to stream")
 
     tracker = sv.ByteTrack()
-    wanted = set(class_ids.keys())
     last_inference = 0.0
     empty_reads = 0
 
@@ -221,7 +365,7 @@ def run_stream(model: YOLO, class_ids: dict[int, str], store: DetectionStore) ->
             with status.lock:
                 status.last_frame_at = now
 
-            # Frame skipping: only run inference at DETECTION_FPS.
+            # Frame skipping: only run inference at the engine's analysis rate.
             if now - last_inference < MIN_FRAME_INTERVAL:
                 continue
             last_inference = now
@@ -230,28 +374,37 @@ def run_stream(model: YOLO, class_ids: dict[int, str], store: DetectionStore) ->
             if not width or not height:
                 continue
 
-            result = model.predict(
-                frame,
-                conf=DETECTION_CONFIDENCE,
-                classes=sorted(wanted),
-                verbose=False,
-            )[0]
-
-            detections = sv.Detections.from_ultralytics(result)
+            detections, labels = detector.detect(frame)
+            # Keep the label list index-aligned with the detections we track.
+            detections.data = dict(detections.data or {})
+            detections.data["label"] = np.array(labels, dtype=object)
             detections = tracker.update_with_detections(detections)
+
+            tracked_labels = detections.data.get("label") if detections.data else None
 
             rows: list[dict] = []
             timestamp = datetime.now(timezone.utc).isoformat()
-            for xyxy, conf, class_id, track_id in zip(
-                detections.xyxy,
-                detections.confidence if detections.confidence is not None else np.zeros(len(detections)),
-                detections.class_id if detections.class_id is not None else np.full(len(detections), -1),
-                detections.tracker_id if detections.tracker_id is not None else np.full(len(detections), -1),
+            confidences = (
+                detections.confidence
+                if detections.confidence is not None
+                else np.zeros(len(detections))
+            )
+            tracker_ids = (
+                detections.tracker_id
+                if detections.tracker_id is not None
+                else np.full(len(detections), -1)
+            )
+            for idx, (xyxy, conf, track_id) in enumerate(
+                zip(detections.xyxy, confidences, tracker_ids)
             ):
                 if track_id is None or int(track_id) < 0:
                     continue
-                name = class_ids.get(int(class_id))
-                if name is None:
+                name = (
+                    str(tracked_labels[idx]).strip().lower()
+                    if tracked_labels is not None and idx < len(tracked_labels)
+                    else ""
+                )
+                if not name:
                     continue
                 x1, y1, x2, y2 = (float(v) for v in xyxy)
                 # Normalise to 0–1 and clamp so partially off-screen boxes stay valid.
@@ -302,18 +455,9 @@ def main() -> None:
 
     start_health_server()
 
-    log.info("Loading YOLOv8n (%s)", MODEL_PATH)
-    model = YOLO(MODEL_PATH)
-
-    # Map the configured class names to the model's class ids.
-    names: dict[int, str] = {int(k): str(v).lower() for k, v in model.names.items()}
-    class_ids = {cid: name for cid, name in names.items() if name in DETECTION_CLASSES}
-    unknown = set(DETECTION_CLASSES) - set(class_ids.values())
-    if unknown:
-        log.warning("Unknown classes ignored: %s", ", ".join(sorted(unknown)))
-    if not class_ids:
-        raise SystemExit("No valid classes in DETECTION_CLASSES")
-    log.info("Detecting: %s", ", ".join(sorted(class_ids.values())))
+    detector = build_detector()
+    log.info("ACTIVE DETECTION ENGINE: %s", detector.name)
+    log.info("Detector config: %s", detector.describe())
 
     store = DetectionStore()
     store.clear()
@@ -322,7 +466,7 @@ def main() -> None:
     backoff = BACKOFF_MIN
     while True:
         try:
-            run_stream(model, class_ids, store)
+            run_stream(detector, store)
             log.warning("Stream ended")
         except Exception as exc:
             log.warning("Stream error: %s", exc)
