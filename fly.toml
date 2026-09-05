@@ -51,7 +51,7 @@ primary_region = "ams"
 
 [[vm]]
   # Dedicated CPU — on shared CPU the machine, not the code, caps the frame rate.
-  size = "performance-2x"
+  size = "performance-8x"
   # 4 GB: torch + the Swin-T backbone does not fit in 2 GB when
   # DETECTION_ENGINE=grounding_dino.
-  memory = "4096mb"
+  memory = "16384mb"
