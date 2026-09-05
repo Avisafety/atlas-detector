@@ -43,7 +43,7 @@ primary_region = "ams"
   TRACKER_LOST_BUFFER = "5"
   # Grounding DINO only — it is much slower on CPU, hence one frame per 5s.
   DETECTION_FPS_GROUNDING_DINO = "0.8"
-  DETECTION_TEXT_PROMPT = "person . chair . fingers. street light . car . boat . truck . bus . motorcycle"
+  DETECTION_TEXT_PROMPT = "person . chair . fingers . street light . car . boat . truck . bus . motorcycle"
   DETECTION_BOX_THRESHOLD = "0.15"
   DETECTION_TEXT_THRESHOLD = "0.20"
   # Tiled full-resolution pass (Grounding DINO only): finds small/distant
