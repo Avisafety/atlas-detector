@@ -24,6 +24,15 @@ RUN pip install --no-cache-dir torch torchvision \
 RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')" \
  && cp /app/yolov8n.pt /app/model.pt 2>/dev/null || true
 
+# Bake the Grounding DINO (Swin-T) checkpoint too, so switching
+# DETECTION_ENGINE=grounding_dino does not trigger a ~700 MB cold-start download.
+ENV HF_HOME=/app/.cache/huggingface
+RUN python -c "\
+from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection; \
+ckpt='IDEA-Research/grounding-dino-tiny'; \
+AutoProcessor.from_pretrained(ckpt); \
+AutoModelForZeroShotObjectDetection.from_pretrained(ckpt)"
+
 COPY app.py .
 
 EXPOSE 8080
