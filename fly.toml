@@ -33,18 +33,25 @@ primary_region = "ams"
 [env]
   # "yolo" (default, fast COCO classes) or "grounding_dino" (text-prompted).
   DETECTION_ENGINE = "yolo"
-  DETECTION_FPS = "5"
+  DETECTION_FPS = "10"
   DETECTION_CLASSES = "person,car,truck,bus,motorcycle,boat"
-  DETECTION_CONFIDENCE = "0.35"
+  # Slightly lower than before: faster hits, at the cost of more false ones.
+  DETECTION_CONFIDENCE = "0.30"
+  # Longest side used for inference. Lower = faster and more responsive boxes.
+  INFER_MAX_SIDE = "480"
+  # Analysed frames a lost track survives inside ByteTrack.
+  TRACKER_LOST_BUFFER = "5"
   # Grounding DINO only — it is much slower on CPU, hence one frame per 5s.
   DETECTION_FPS_GROUNDING_DINO = "0.2"
   DETECTION_TEXT_PROMPT = "person . car . boat . truck . bus . motorcycle"
   DETECTION_BOX_THRESHOLD = "0.25"
   DETECTION_TEXT_THRESHOLD = "0.20"
-  TRACK_TTL_SECONDS = "3"
+  # Boxes disappear fast when an object leaves the frame.
+  TRACK_TTL_SECONDS = "0.8"
 
 [[vm]]
-  size = "shared-cpu-2x"
+  # Dedicated CPU — on shared CPU the machine, not the code, caps the frame rate.
+  size = "performance-2x"
   # 4 GB: torch + the Swin-T backbone does not fit in 2 GB when
   # DETECTION_ENGINE=grounding_dino.
   memory = "4096mb"

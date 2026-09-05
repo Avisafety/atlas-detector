@@ -13,14 +13,16 @@ CPU only. Everything is configured through environment variables:
   SUPABASE_SERVICE_ROLE_KEY
   FLIGHT_SESSION_ID             active_flights.id the detections belong to
   DETECTION_ENGINE              yolo (default) | grounding_dino
-  DETECTION_FPS                 analysis rate for yolo, default 5
+  DETECTION_FPS                 analysis rate for yolo, default 10
   DETECTION_FPS_GROUNDING_DINO  analysis rate for grounding_dino, default 0.2
   DETECTION_CLASSES             yolo only, default person,car,truck,bus,motorcycle,boat
-  DETECTION_CONFIDENCE          yolo only, default 0.35
+  DETECTION_CONFIDENCE          yolo only, default 0.30
   DETECTION_TEXT_PROMPT         grounding_dino only, "person . car . boat . ..."
   DETECTION_BOX_THRESHOLD       grounding_dino only, default 0.25
   DETECTION_TEXT_THRESHOLD      grounding_dino only, default 0.20
-  TRACK_TTL_SECONDS             default 3
+  INFER_MAX_SIDE                downscale longest side before inference, default 480
+  TRACKER_LOST_BUFFER           analysed frames a lost track survives, default 5
+  TRACK_TTL_SECONDS             default 0.8
 """
 
 from __future__ import annotations
@@ -55,12 +57,16 @@ FLIGHT_SESSION_ID = os.environ.get("FLIGHT_SESSION_ID", "").strip()
 
 DETECTION_ENGINE = (os.environ.get("DETECTION_ENGINE", "yolo") or "yolo").strip().lower()
 
-DETECTION_FPS = float(os.environ.get("DETECTION_FPS", "5") or 5)
+DETECTION_FPS = float(os.environ.get("DETECTION_FPS", "10") or 10)
 DETECTION_FPS_GROUNDING_DINO = float(
     os.environ.get("DETECTION_FPS_GROUNDING_DINO", "0.2") or 0.2
 )
-DETECTION_CONFIDENCE = float(os.environ.get("DETECTION_CONFIDENCE", "0.35") or 0.35)
-TRACK_TTL_SECONDS = float(os.environ.get("TRACK_TTL_SECONDS", "3") or 3)
+DETECTION_CONFIDENCE = float(os.environ.get("DETECTION_CONFIDENCE", "0.30") or 0.30)
+TRACK_TTL_SECONDS = float(os.environ.get("TRACK_TTL_SECONDS", "0.8") or 0.8)
+# Downscale before inference: the single biggest latency win on CPU. 0 = off.
+INFER_MAX_SIDE = int(os.environ.get("INFER_MAX_SIDE", "480") or 480)
+# How many analysed frames a lost track survives inside the tracker.
+TRACKER_LOST_BUFFER = int(os.environ.get("TRACKER_LOST_BUFFER", "5") or 5)
 DETECTION_CLASSES = [
     c.strip().lower()
     for c in os.environ.get(
@@ -314,7 +320,9 @@ class DetectionStore:
 
 def cleanup_loop(store: DetectionStore) -> None:
     while True:
-        time.sleep(max(1.0, TRACK_TTL_SECONDS / 2))
+        # Sweep at least twice per TTL so boxes vanish quickly after an object
+        # leaves the frame, with a 0.4s floor to keep write volume sane.
+        time.sleep(max(0.4, TRACK_TTL_SECONDS / 2))
         store.prune()
 
 
@@ -393,7 +401,13 @@ def run_stream(detector, store: DetectionStore) -> None:
         status.connected = True
     log.info("Connected to stream")
 
-    tracker = sv.ByteTrack()
+    # Fast-reacting tracker: short memory for lost tracks and a frame rate that
+    # matches the actual analysis rate, so positions are not extrapolated far.
+    tracker = sv.ByteTrack(
+        lost_track_buffer=TRACKER_LOST_BUFFER,
+        frame_rate=max(1, int(round(ANALYSIS_FPS))),
+        track_activation_threshold=min(0.25, DETECTION_CONFIDENCE),
+    )
     grabber = FrameGrabber(cap)
     last_seq = 0
     last_inference = 0.0
@@ -418,13 +432,20 @@ def run_stream(detector, store: DetectionStore) -> None:
             last_inference = now
             with status.lock:
                 status.last_frame_at = now
-
-
-
-
-            height, width = frame.shape[:2]
-            if not width or not height:
+            src_h, src_w = frame.shape[:2]
+            if not src_w or not src_h:
                 continue
+
+            # Downscale before inference — boxes stay correct because they are
+            # normalised against the frame we actually analysed.
+            if INFER_MAX_SIDE and max(src_w, src_h) > INFER_MAX_SIDE:
+                scale = INFER_MAX_SIDE / float(max(src_w, src_h))
+                frame = cv2.resize(
+                    frame,
+                    (max(1, int(src_w * scale)), max(1, int(src_h * scale))),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+            height, width = frame.shape[:2]
 
             detections, labels = detector.detect(frame)
             # Keep the label list index-aligned with the detections we track.
