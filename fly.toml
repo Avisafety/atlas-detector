@@ -37,29 +37,32 @@ primary_region = "ams"
   DETECTION_CLASSES = "person,car,truck,bus,motorcycle,boat"
   # Slightly lower than before: faster hits, at the cost of more false ones.
   DETECTION_CONFIDENCE = "0.30"
-  # Longest side used for inference. Lower = faster and more responsive boxes.
-  INFER_MAX_SIDE = "480"
+  # Longest side used for inference. Grounding DINO's processor rescales to
+  # shortest edge 800 anyway, so 480 only threw away detail.
+  INFER_MAX_SIDE = "800"
   # Analysed frames a lost track survives inside ByteTrack.
   TRACKER_LOST_BUFFER = "5"
-  # Grounding DINO only — it is much slower on CPU, hence one frame per 5s.
+  # Grounding DINO only — much slower on CPU.
   DETECTION_FPS_GROUNDING_DINO = "0.8"
-  DETECTION_TEXT_PROMPT = "person . chair . fingers . street light . car . boat . truck . bus . motorcycle"
-  DETECTION_BOX_THRESHOLD = "0.15"
+  DETECTION_TEXT_PROMPT = "person . car . boat . truck . bus . motorcycle"
+  DETECTION_BOX_THRESHOLD = "0.25"
   DETECTION_TEXT_THRESHOLD = "0.20"
-  # Tiled full-resolution pass (Grounding DINO only): finds small/distant
-  # objects the downscaled fast pass loses. Tiles run in parallel on the
-  # dedicated cores below.
-  DETECTION_FPS_TILED = "2.0"
-  TILE_GRID = "3x5"
+  # Tiled full-resolution scout (Grounding DINO only): finds small/distant
+  # objects the downscaled fast pass loses. Kept modest so it does not eat the
+  # whole CPU budget and starve the fast pass.
+  DETECTION_FPS_TILED = "0.3"
+  TILE_GRID = "2x3"
   TILE_OVERLAP = "0.15"
+  TORCH_THREADS = "2"
   ROI_PADDING = "0.2"
   ROI_CONFIRM_FRAMES = "2"
   ROI_MISS_LIMIT = "10"
-  ROI_MAX = "15"
+  ROI_MAX = "6"
   ROI_IOU_MATCH = "0.6"
 
   # Boxes disappear fast when an object leaves the frame.
   TRACK_TTL_SECONDS = "5.0"
+
 
 
 [[vm]]

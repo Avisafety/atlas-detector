@@ -110,6 +110,9 @@ ROI_CONFIRM_FRAMES = int(os.environ.get("ROI_CONFIRM_FRAMES", "5") or 5)
 ROI_MISS_LIMIT = int(os.environ.get("ROI_MISS_LIMIT", "10") or 10)
 ROI_MAX = int(os.environ.get("ROI_MAX", "8") or 8)
 ROI_IOU_MATCH = float(os.environ.get("ROI_IOU_MATCH", "0.3") or 0.3)
+# PyTorch intra-op threads per inference (tiled pass shares the CPU budget).
+TORCH_THREADS = int(os.environ.get("TORCH_THREADS", "2") or 2)
+
 
 
 
@@ -283,12 +286,18 @@ class GroundingDinoDetector:
 
         self._pool: ThreadPoolExecutor | None = None
         if TILED_ENABLED:
-            # One inference per tile, all at once. PyTorch's own intra-op
-            # threading would otherwise fight the pool for the same cores.
-            torch.set_num_threads(1)
+            # Never run more tiles at once than we have cores: an over-sized
+            # pool only makes every single inference slower and starves the
+            # fast pass. 2 intra-op threads keeps one inference from being
+            # pinned to a single core.
+            cpus = os.cpu_count() or 2
+            torch.set_num_threads(max(1, TORCH_THREADS))
+            workers = max(1, min(TILE_ROWS * TILE_COLS, max(1, cpus // max(1, TORCH_THREADS))))
             self._pool = ThreadPoolExecutor(
-                max_workers=TILE_ROWS * TILE_COLS, thread_name_prefix="tile"
+                max_workers=workers, thread_name_prefix="tile"
             )
+            log.info("Tile pool: %d worker(s) on %d cpu(s)", workers, cpus)
+
             log.info(
                 "Tiled pass enabled: grid=%dx%d overlap=%.2f fps=%.2f",
                 TILE_ROWS,
@@ -739,7 +748,23 @@ class FrameGrabber:
         self._stop.set()
 
 
+def _fallback_track_id(label: str, box, width: int, height: int) -> int:
+    """Stable id for an untracked detection, derived from class + position.
+
+    A coarse 32x32 grid cell means the same object keeps the same id across
+    frames as long as it does not move far, so the row is updated rather than
+    duplicated.
+    """
+    cx = (float(box[0]) + float(box[2])) / 2.0
+    cy = (float(box[1]) + float(box[3])) / 2.0
+    gx = int(max(0, min(31, cx / max(1, width) * 32)))
+    gy = int(max(0, min(31, cy / max(1, height) * 32)))
+    base = abs(hash((label, gx, gy))) % 500_000
+    return 500_000 + base
+
+
 def build_rows(detections, width: int, height: int) -> list[dict]:
+
     """Turn tracked detections into atlas_detections rows (normalised boxes)."""
     tracked_labels = detections.data.get("label") if detections.data else None
     timestamp = datetime.now(timezone.utc).isoformat()
@@ -818,12 +843,17 @@ def tiled_worker(detector, rois: RoiRegistry, grabber, stop: threading.Event) ->
             detections, _labels = detector.detect_tiled(frame)
             boxes = np.asarray(detections.xyxy, dtype=np.float32).reshape(-1, 4)
             added = rois.add_candidates(boxes, width, height)
-            if added:
-                log.info("Tiled scout nominated %d new ROI(s)", added)
+            log.info(
+                "tiled scout: %d hit(s), %d new ROI(s) in %.0f ms",
+                len(boxes),
+                added,
+                (time.time() - started) * 1000.0,
+            )
         except Exception as exc:
             log.warning("Tiled pass failed: %s", exc)
         elapsed = time.time() - started
         stop.wait(max(0.05, TILED_FRAME_INTERVAL - elapsed))
+
 
 
 def run_stream(detector, store: DetectionStore) -> None:
@@ -898,8 +928,10 @@ def run_stream(detector, store: DetectionStore) -> None:
                 )
             height, width = frame.shape[:2]
 
+            infer_started = time.time()
             detections, labels = detector.detect(frame)
-            log.info("RAW DETECT: %d boxes labels=%s", len(detections), labels)
+            infer_ms = (time.time() - infer_started) * 1000.0
+
 
             if roi_registry is not None:
                 active = roi_registry.snapshot()
@@ -939,10 +971,53 @@ def run_stream(detector, store: DetectionStore) -> None:
                 else:
                     detections = sv.Detections.empty()
 
+            raw_count = len(detections)
+            raw_labels = list(labels)
+            raw_boxes = np.asarray(detections.xyxy, dtype=np.float32).reshape(-1, 4)
+            raw_scores = (
+                np.asarray(detections.confidence, dtype=np.float32).reshape(-1)
+                if detections.confidence is not None
+                else np.zeros(raw_count, dtype=np.float32)
+            )
+
             # Keep the label list index-aligned with the detections we track.
             detections = tracker.update_with_detections(attach_labels(detections, labels))
             rows = build_rows(detections, width, height)
-            log.info("AFTER TRACKER: %d tracked, data_keys=%s, labels=%s, rows_built=%d", len(detections), list(detections.data.keys()) if detections.data else None, detections.data.get("label") if detections.data else None, len(rows))
+
+            # At low analysis rates ByteTrack only emits a track once it has
+            # been matched on a second frame, so slow engines (Grounding DINO)
+            # can detect objects continuously and still write nothing. Fall
+            # back to the raw detections with stable, position-derived ids.
+            if not rows and raw_count:
+                rows = build_rows(
+                    attach_labels(
+                        sv.Detections(
+                            xyxy=raw_boxes,
+                            confidence=raw_scores,
+                            class_id=np.zeros(raw_count, dtype=int),
+                            tracker_id=np.array(
+                                [
+                                    _fallback_track_id(raw_labels[i] if i < len(raw_labels) else "", raw_boxes[i], width, height)
+                                    for i in range(raw_count)
+                                ],
+                                dtype=int,
+                            ),
+                        ),
+                        raw_labels,
+                    ),
+                    width,
+                    height,
+                )
+
+            log.info(
+                "fast pass: %d raw -> %d tracked -> %d row(s) in %.0f ms (labels=%s)",
+                raw_count,
+                len(detections),
+                len(rows),
+                infer_ms,
+                raw_labels[:6],
+            )
+
 
             if roi_registry is not None:
                 tracked = np.asarray(detections.xyxy, dtype=np.float32).reshape(-1, 4)
