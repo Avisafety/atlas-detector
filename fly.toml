@@ -31,8 +31,8 @@ primary_region = "ams"
     path = "/health"
 
 [env]
-  # "yolo" (default, fast COCO classes) or "grounding_dino" (text-prompted).
-  DETECTION_ENGINE = "yolo"
+  # "yolo" (fast COCO classes, 10fps) or "grounding_dino" (text-prompted, tuned config below).
+  DETECTION_ENGINE = "grounding_dino"
   DETECTION_FPS = "10"
   DETECTION_CLASSES = "person,car,truck,bus,motorcycle,boat"
   # Slightly lower than before: faster hits, at the cost of more false ones.
