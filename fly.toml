@@ -1,33 +1,50 @@
-# fly.toml app configuration file generated for atlas-detector on 2026-09-04T20:43:03Z
+# Fly.io service definition for atlas-detector.
 #
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+# Runs in the same organisation as the `live-video` MediaMTX app, so it reaches
+# the media server over the private 6PN network at live-video.internal:8554
+# (RTSP is not exposed publicly).
 #
+# Deploy manually from this directory:
+#   fly deploy
+#
+# Required secrets:
+#   fly secrets set MEDIAMTX_RTSP_URL=... SUPABASE_URL=... \
+#     SUPABASE_SERVICE_ROLE_KEY=... FLIGHT_SESSION_ID=...
 
-app = 'atlas-detector'
-primary_region = 'ams'
+app = "atlas-detector"
+primary_region = "ams"
 
 [build]
-
-[env]
-  DETECTION_CLASSES = 'person,car,truck,bus,motorcycle,boat'
-  DETECTION_CONFIDENCE = '0.35'
-  DETECTION_FPS = '5'
-  TRACK_TTL_SECONDS = '3'
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = 'off'
+  auto_stop_machines = "off"
   auto_start_machines = true
   min_machines_running = 1
 
   [[http_service.checks]]
-    interval = '30s'
-    timeout = '5s'
-    grace_period = '1m0s'
-    method = 'GET'
-    path = '/health'
+    grace_period = "60s"
+    interval = "30s"
+    method = "GET"
+    timeout = "5s"
+    path = "/health"
+
+[env]
+  # "yolo" (default, fast COCO classes) or "grounding_dino" (text-prompted).
+  DETECTION_ENGINE = "yolo"
+  DETECTION_FPS = "5"
+  DETECTION_CLASSES = "person,car,truck,bus,motorcycle,boat"
+  DETECTION_CONFIDENCE = "0.35"
+  # Grounding DINO only — it is much slower on CPU, hence one frame per 5s.
+  DETECTION_FPS_GROUNDING_DINO = "0.2"
+  DETECTION_TEXT_PROMPT = "person . car . boat . truck . bus . motorcycle"
+  DETECTION_BOX_THRESHOLD = "0.25"
+  DETECTION_TEXT_THRESHOLD = "0.20"
+  TRACK_TTL_SECONDS = "3"
 
 [[vm]]
-  size = 'shared-cpu-2x'
-  memory = '2048mb'
+  size = "shared-cpu-2x"
+  # 4 GB: torch + the Swin-T backbone does not fit in 2 GB when
+  # DETECTION_ENGINE=grounding_dino.
+  memory = "4096mb"
