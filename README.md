@@ -51,10 +51,34 @@ cd ../atlas-video && fly deploy
 | `SUPABASE_URL` | – | Required |
 | `SUPABASE_SERVICE_ROLE_KEY` | – | Required |
 | `FLIGHT_SESSION_ID` | – | `active_flights.id` the detections belong to (required) |
-| `DETECTION_FPS` | `5` | Frames analysed per second |
-| `DETECTION_CLASSES` | `person,car,truck,bus,motorcycle,boat` | COCO class names |
-| `DETECTION_CONFIDENCE` | `0.35` | Minimum score |
+| `DETECTION_ENGINE` | `yolo` | `yolo` or `grounding_dino` |
+| `DETECTION_FPS` | `5` | Frames analysed per second (YOLO) |
+| `DETECTION_CLASSES` | `person,car,truck,bus,motorcycle,boat` | COCO class names (YOLO) |
+| `DETECTION_CONFIDENCE` | `0.35` | Minimum score (YOLO) |
+| `DETECTION_FPS_GROUNDING_DINO` | `0.2` | Frames per second (Grounding DINO) |
+| `DETECTION_TEXT_PROMPT` | `person . car . boat . truck . bus . motorcycle` | Prompt (Grounding DINO) |
+| `DETECTION_BOX_THRESHOLD` | `0.25` | Box confidence (Grounding DINO) |
+| `DETECTION_TEXT_THRESHOLD` | `0.20` | Text-match threshold (Grounding DINO) |
 | `TRACK_TTL_SECONDS` | `3` | Tracks without updates are deleted after this |
+
+## Detection engines
+
+Both engines live in `app.py` and are selected with `DETECTION_ENGINE`:
+
+- **`yolo` (default)** — YOLOv8n on the fixed COCO class list. Fast, ~5 fps.
+- **`grounding_dino`** — `IDEA-Research/grounding-dino-tiny` (Swin-T) through
+  Hugging Face `transformers`. Open vocabulary: categories come from
+  `DETECTION_TEXT_PROMPT`, separated by ` . `. Slower on CPU, so it defaults to
+  one frame every 5 seconds. `object_class` is the text label the model matched.
+
+Both engines feed the same ByteTrack tracker and write the same rows to
+`atlas_detections`. The startup log prints the active engine, checkpoint,
+prompt/classes, thresholds and effective fps — check `fly logs` to confirm.
+
+```bash
+fly secrets set DETECTION_ENGINE=grounding_dino \
+  DETECTION_TEXT_PROMPT="person . boat . life raft . kayak"
+```
 
 ## Health
 
