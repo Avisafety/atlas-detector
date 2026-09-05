@@ -324,6 +324,10 @@ def cleanup_loop(store: DetectionStore) -> None:
 
 
 def open_capture(url: str) -> cv2.VideoCapture | None:
+    # Low-latency FFmpeg options: TCP transport, no buffering, no reordering.
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+        "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|reorder_queue_size;0|max_delay;0"
+    )
     cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
     if not cap.isOpened():
         cap.release()
@@ -334,6 +338,49 @@ def open_capture(url: str) -> cv2.VideoCapture | None:
     except Exception:
         pass
     return cap
+
+
+class FrameGrabber:
+    """Continuously drains the RTSP stream and keeps only the newest frame.
+
+    Without this, cv2.VideoCapture.read() returns queued frames one by one, so
+    inference slower than the stream's framerate makes the analysed frame drift
+    further and further behind live video — boxes then lag and look inaccurate.
+    """
+
+    def __init__(self, cap: cv2.VideoCapture) -> None:
+        self._cap = cap
+        self._lock = threading.Lock()
+        self._frame = None
+        self._seq = 0
+        self._error: str | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="grabber")
+        self._thread.start()
+
+    def _run(self) -> None:
+        empty_reads = 0
+        while not self._stop.is_set():
+            ok, frame = self._cap.read()
+            if not ok or frame is None:
+                empty_reads += 1
+                if empty_reads > 60:
+                    with self._lock:
+                        self._error = "stream returned no frames"
+                    return
+                time.sleep(0.05)
+                continue
+            empty_reads = 0
+            with self._lock:
+                self._frame = frame
+                self._seq += 1
+
+    def latest(self):
+        with self._lock:
+            return self._frame, self._seq, self._error
+
+    def stop(self) -> None:
+        self._stop.set()
 
 
 def run_stream(detector, store: DetectionStore) -> None:
@@ -347,28 +394,33 @@ def run_stream(detector, store: DetectionStore) -> None:
     log.info("Connected to stream")
 
     tracker = sv.ByteTrack()
+    grabber = FrameGrabber(cap)
+    last_seq = 0
     last_inference = 0.0
-    empty_reads = 0
 
     try:
         while True:
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                empty_reads += 1
-                if empty_reads > 60:
-                    raise ConnectionError("stream returned no frames")
-                time.sleep(0.05)
+            frame, seq, error = grabber.latest()
+            if error:
+                raise ConnectionError(error)
+            if frame is None or seq == last_seq:
+                # No new frame yet — wait briefly instead of re-analysing.
+                time.sleep(0.02)
                 continue
-            empty_reads = 0
 
             now = time.time()
+            # Pace inference to the engine's analysis rate, but always on the
+            # newest available frame (never on a queued, stale one).
+            if now - last_inference < MIN_FRAME_INTERVAL:
+                time.sleep(min(0.02, MIN_FRAME_INTERVAL))
+                continue
+            last_seq = seq
+            last_inference = now
             with status.lock:
                 status.last_frame_at = now
 
-            # Frame skipping: only run inference at the engine's analysis rate.
-            if now - last_inference < MIN_FRAME_INTERVAL:
-                continue
-            last_inference = now
+
+
 
             height, width = frame.shape[:2]
             if not width or not height:
@@ -433,7 +485,9 @@ def run_stream(detector, store: DetectionStore) -> None:
 
             store.upsert(rows)
     finally:
+        grabber.stop()
         cap.release()
+
         with status.lock:
             status.connected = False
             status.active_tracks = 0
