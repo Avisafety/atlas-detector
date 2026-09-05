@@ -59,7 +59,7 @@ primary_region = "ams"
   ROI_IOU_MATCH = "0.6"
 
   # Boxes disappear fast when an object leaves the frame.
-  TRACK_TTL_SECONDS = "0.8"
+  TRACK_TTL_SECONDS = "5.0"
 
 
 [[vm]]
