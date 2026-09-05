@@ -59,7 +59,17 @@ cd ../atlas-video && fly deploy
 | `DETECTION_TEXT_PROMPT` | `person . car . boat . truck . bus . motorcycle` | Prompt (Grounding DINO) |
 | `DETECTION_BOX_THRESHOLD` | `0.25` | Box confidence (Grounding DINO) |
 | `DETECTION_TEXT_THRESHOLD` | `0.20` | Text-match threshold (Grounding DINO) |
+| `DETECTION_FPS_TILED` | `1.5` | Tiled full-resolution pass rate (Grounding DINO) |
+| `TILE_GRID` | `2x3` | Tile grid, `rows x cols` |
+| `TILE_OVERLAP` | `0.15` | Tile overlap fraction |
+| `TILE_IOU_THRESHOLD` | `0.5` | IoU used to dedupe boxes from overlapping tiles |
+| `ROI_PADDING` | `0.2` | Margin added around a scouted region before cropping |
+| `ROI_CONFIRM_FRAMES` | `5` | Hits before an ROI retires into normal tracking |
+| `ROI_MISS_LIMIT` | `10` | Empty crops before an ROI is dropped |
+| `ROI_MAX` | `8` | Maximum simultaneous ROIs |
+| `ROI_IOU_MATCH` | `0.3` | IoU above which a scout hit counts as already known |
 | `TRACK_TTL_SECONDS` | `3` | Tracks without updates are deleted after this |
+
 
 ## Detection engines
 
@@ -79,6 +89,35 @@ prompt/classes, thresholds and effective fps — check `fly logs` to confirm.
 fly secrets set DETECTION_ENGINE=grounding_dino \
   DETECTION_TEXT_PROMPT="person . boat . life raft . kayak"
 ```
+
+## Search-and-track (Grounding DINO)
+
+The fast pass downscales the frame to `INFER_MAX_SIDE`, which keeps boxes
+responsive but makes small, distant objects disappear. When
+`DETECTION_ENGINE=grounding_dino`, a tiled scout thread runs beside it:
+
+- the frame is split into a `TILE_GRID` (default 2x3) of tiles with
+  `TILE_OVERLAP` (15%) overlap,
+- each tile is analysed at native resolution, all tiles in parallel through a
+  `ThreadPoolExecutor` (`torch.set_num_threads(1)` so PyTorch does not fight the
+  pool for cores),
+- boxes are mapped back to full-frame coordinates and deduped with class-aware
+  IoU NMS,
+- hits that do not overlap (IoU > `ROI_IOU_MATCH`) an existing ROI or a box the
+  fast pass just tracked become new ROIs. **The scout never writes rows.**
+
+Every analysed frame, the fast pass crops each active ROI from the original
+full-resolution frame, runs the detector on it, maps the boxes back, and merges
+them with the whole-frame detections. One ByteTrack instance receives the merged
+list, so an object is never drawn twice.
+
+An ROI retires after `ROI_CONFIRM_FRAMES` hits (the main tracker owns it now) or
+`ROI_MISS_LIMIT` empty crops. At most `ROI_MAX` ROIs are active at once.
+
+The scout runs at `DETECTION_FPS_TILED` (default 1.5/s). This needs a
+dedicated-CPU machine (`performance-8x` in `fly.toml`).
+
+
 
 ## Health
 

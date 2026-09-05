@@ -46,8 +46,21 @@ primary_region = "ams"
   DETECTION_TEXT_PROMPT = "person . car . boat . truck . bus . motorcycle"
   DETECTION_BOX_THRESHOLD = "0.25"
   DETECTION_TEXT_THRESHOLD = "0.20"
+  # Tiled full-resolution pass (Grounding DINO only): finds small/distant
+  # objects the downscaled fast pass loses. Tiles run in parallel on the
+  # dedicated cores below.
+  DETECTION_FPS_TILED = "1.5"
+  TILE_GRID = "2x3"
+  TILE_OVERLAP = "0.15"
+  ROI_PADDING = "0.2"
+  ROI_CONFIRM_FRAMES = "5"
+  ROI_MISS_LIMIT = "10"
+  ROI_MAX = "8"
+  ROI_IOU_MATCH = "0.3"
+
   # Boxes disappear fast when an object leaves the frame.
   TRACK_TTL_SECONDS = "0.8"
+
 
 [[vm]]
   # Dedicated CPU — on shared CPU the machine, not the code, caps the frame rate.
