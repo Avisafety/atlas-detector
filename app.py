@@ -318,7 +318,7 @@ class GroundingDinoDetector:
         results = self.processor.post_process_grounded_object_detection(
             outputs,
             inputs.input_ids,
-            threshold=DETECTION_BOX_THRESHOLD,
+            box_threshold=DETECTION_BOX_THRESHOLD,
             text_threshold=DETECTION_TEXT_THRESHOLD,
             target_sizes=[(height, width)],
         )[0]
