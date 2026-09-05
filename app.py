@@ -899,6 +899,7 @@ def run_stream(detector, store: DetectionStore) -> None:
             height, width = frame.shape[:2]
 
             detections, labels = detector.detect(frame)
+            log.info("RAW DETECT: %d boxes labels=%s", len(detections), labels)
 
             if roi_registry is not None:
                 active = roi_registry.snapshot()
@@ -941,6 +942,7 @@ def run_stream(detector, store: DetectionStore) -> None:
             # Keep the label list index-aligned with the detections we track.
             detections = tracker.update_with_detections(attach_labels(detections, labels))
             rows = build_rows(detections, width, height)
+            log.info("AFTER TRACKER: %d tracked, data_keys=%s, labels=%s, rows_built=%d", len(detections), list(detections.data.keys()) if detections.data else None, detections.data.get("label") if detections.data else None, len(rows))
 
             if roi_registry is not None:
                 tracked = np.asarray(detections.xyxy, dtype=np.float32).reshape(-1, 4)
