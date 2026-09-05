@@ -32,7 +32,7 @@ primary_region = "ams"
 
 [env]
   # "yolo" (fast COCO classes, 10fps) or "grounding_dino" (text-prompted, tuned config below).
-  DETECTION_ENGINE = "grounding_dino"
+  DETECTION_ENGINE = "yolo"
   DETECTION_FPS = "10"
   DETECTION_CLASSES = "person,car,truck,bus,motorcycle,boat"
   # Slightly lower than before: faster hits, at the cost of more false ones.
