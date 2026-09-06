@@ -52,7 +52,7 @@ primary_region = "ams"
   # Analysed frames a lost track survives inside ByteTrack.
   TRACKER_LOST_BUFFER = "5"
   # Boxes disappear fast when an object leaves the frame.
-  TRACK_TTL_SECONDS = "0.8"
+  TRACK_TTL_SECONDS = "0.2"
 
   # Long-range pass: tiled full-resolution analysis at a low cadence, merged
   # into the same tracker. Catches small/distant objects the downscale loses.
