@@ -113,6 +113,21 @@ RANGE_TILE_OVERLAP = float(os.environ.get("RANGE_TILE_OVERLAP", "0.15") or 0.15)
 RANGE_CONFIDENCE = float(os.environ.get("RANGE_CONFIDENCE", "0.15") or 0.15)
 # IoU at which a range box that overlaps a fast box of the same class is dropped.
 RANGE_DEDUPE_IOU = float(os.environ.get("RANGE_DEDUPE_IOU", "0.5") or 0.5)
+# Containment suppression: a tile can only see part of an object (a torso, a
+# head), so its box sits INSIDE the full-frame box. Two such boxes have low IoU
+# by definition, which is why IoU alone let duplicates through. This compares
+# the overlap against the SMALLER box instead: 0.7 means "70% of the smaller box
+# lies inside the larger one -> same object". Two genuinely separate people
+# standing side by side barely overlap, so they are never merged.
+RANGE_CONTAINMENT = float(os.environ.get("RANGE_CONTAINMENT", "0.7") or 0.7)
+# Range results are re-fed to the tracker between passes, but only while fresh:
+# a stale box keeps its old position while the object moves on, which spawns a
+# ghost track next to the real one.
+RANGE_RESULT_MAX_AGE_SECONDS = float(
+    os.environ.get("RANGE_RESULT_MAX_AGE_SECONDS", "0") or 0
+) or (RANGE_PASS_INTERVAL_SECONDS + 0.5)
+# Temporary diagnostics: log per-source counts and every suppressed duplicate.
+RANGE_DEBUG = os.environ.get("RANGE_DEBUG", "false").lower() == "true"
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "yolov8n.pt")
 
@@ -507,16 +522,22 @@ def build_rows(detections, session_id: str, width: int, height: int) -> list[dic
 
 
 def tile_offsets(width: int, height: int, cols: int, rows: int, overlap: float):
-    """Yield (x0, y0, x1, y1) tile windows covering the frame with overlap."""
-    base_w = max(1, width // cols)
-    base_h = max(1, height // rows)
-    step_x = max(1, int(base_w * (1.0 - overlap)))
-    step_y = max(1, int(base_h * (1.0 - overlap)))
+    """Yield (x0, y0, x1, y1) tile windows covering the WHOLE frame with overlap.
+
+    The tiles are sized so that `cols` overlapping windows span the full width
+    (and `rows` the full height) — otherwise the right/bottom edge of the frame
+    is never analysed by the range pass.
+    """
+    overlap = min(max(overlap, 0.0), 0.5)
+    tile_w = max(1, int(round(width / (cols - (cols - 1) * overlap)))) if cols > 1 else width
+    tile_h = max(1, int(round(height / (rows - (rows - 1) * overlap)))) if rows > 1 else height
+    step_x = max(1, int(round(tile_w * (1.0 - overlap))))
+    step_y = max(1, int(round(tile_h * (1.0 - overlap))))
     for r in range(rows):
         for c in range(cols):
-            x0 = min(c * step_x, max(0, width - base_w))
-            y0 = min(r * step_y, max(0, height - base_h))
-            yield x0, y0, x0 + base_w, y0 + base_h
+            x0 = min(c * step_x, max(0, width - tile_w))
+            y0 = min(r * step_y, max(0, height - tile_h))
+            yield x0, y0, min(width, x0 + tile_w), min(height, y0 + tile_h)
 
 
 def iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -534,11 +555,50 @@ def iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return np.where(union > 0, inter / np.maximum(union, 1e-9), 0.0)
 
 
-def dedupe_class_aware(detections, labels: list[str], iou_thr: float):
-    """Drop lower-confidence duplicates of the same class (tile overlap)."""
+def containment_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Pairwise intersection over the SMALLER box area -> (n, m).
+
+    Catches the tile artefact IoU misses: a partial box (torso) fully inside a
+    full-body box scores ~1.0 here but only ~0.3 on IoU. Two distinct objects
+    next to each other still score near 0, so they are never merged.
+    """
+    if len(a) == 0 or len(b) == 0:
+        return np.zeros((len(a), len(b)))
+    ax1, ay1, ax2, ay2 = a[:, 0:1], a[:, 1:2], a[:, 2:3], a[:, 3:4]
+    bx1, by1, bx2, by2 = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+    inter_w = np.clip(np.minimum(ax2, bx2) - np.maximum(ax1, bx1), 0, None)
+    inter_h = np.clip(np.minimum(ay2, by2) - np.maximum(ay1, by1), 0, None)
+    inter = inter_w * inter_h
+    area_a = np.clip((ax2 - ax1) * (ay2 - ay1), 0, None)
+    area_b = np.clip((bx2 - bx1) * (by2 - by1), 0, None)
+    smaller = np.minimum(area_a, area_b)
+    return np.where(smaller > 0, inter / np.maximum(smaller, 1e-9), 0.0)
+
+
+def is_duplicate(box_a: np.ndarray, box_b: np.ndarray) -> bool:
+    """True when two same-class boxes describe the same physical object."""
+    a = box_a.reshape(1, 4)
+    b = box_b.reshape(1, 4)
+    if iou_matrix(a, b)[0, 0] > RANGE_DEDUPE_IOU:
+        return True
+    return containment_matrix(a, b)[0, 0] > RANGE_CONTAINMENT
+
+
+def dedupe_class_aware(detections, labels: list[str], iou_thr: float | None = None):
+    """Keep the highest-confidence box per physical object, per class.
+
+    Suppression is IoU *and* containment based — see `is_duplicate`. Applied to
+    the merged fast+range set right before the tracker, so one object can only
+    ever hand the tracker one box, no matter which pass found it.
+    """
     if len(detections) <= 1:
         return detections, labels
-    order = np.argsort(-detections.confidence)
+    confidence = (
+        detections.confidence
+        if detections.confidence is not None
+        else np.zeros(len(detections))
+    )
+    order = np.argsort(-confidence)
     keep: list[int] = []
     boxes = detections.xyxy
     for idx in order:
@@ -546,8 +606,18 @@ def dedupe_class_aware(detections, labels: list[str], iou_thr: float):
         for kept in keep:
             if labels[kept] != labels[idx]:
                 continue
-            if iou_matrix(boxes[idx : idx + 1], boxes[kept : kept + 1])[0, 0] > iou_thr:
+            if is_duplicate(boxes[idx], boxes[kept]):
                 duplicate = True
+                if RANGE_DEBUG:
+                    log.info(
+                        "dedupe: dropped %s %.2f (iou %.2f / containment %.2f vs %s %.2f)",
+                        labels[idx],
+                        confidence[idx],
+                        iou_matrix(boxes[idx].reshape(1, 4), boxes[kept].reshape(1, 4))[0, 0],
+                        containment_matrix(boxes[idx].reshape(1, 4), boxes[kept].reshape(1, 4))[0, 0],
+                        labels[kept],
+                        confidence[kept],
+                    )
                 break
         if not duplicate:
             keep.append(int(idx))
@@ -574,6 +644,7 @@ class RangeScanner:
         self._lock = threading.Lock()
         self._detections: sv.Detections | None = None
         self._labels: list[str] = []
+        self._updated_at: float = 0.0
         self._thread = threading.Thread(
             target=self._run, daemon=True, name=f"range-{path}"
         )
@@ -582,9 +653,9 @@ class RangeScanner:
     def stop(self) -> None:
         self._stop.set()
 
-    def latest(self) -> tuple[sv.Detections | None, list[str]]:
+    def latest(self) -> tuple[sv.Detections | None, list[str], float]:
         with self._lock:
-            return self._detections, list(self._labels)
+            return self._detections, list(self._labels), self._updated_at
 
     def _run(self) -> None:
         log.info(
@@ -626,30 +697,60 @@ class RangeScanner:
             if len(detections) == 0:
                 continue
             boxes = detections.xyxy.copy()
+            confidence = (
+                detections.confidence
+                if detections.confidence is not None
+                else np.zeros(len(detections))
+            )
+            # A tile can cut an object in half — the resulting torso/head box is
+            # a fragment, not an object. Drop boxes that touch a tile edge which
+            # is not also a frame edge; the overlapping neighbour tile sees the
+            # whole object anyway.
+            margin = 2.0
+            keep_tile: list[int] = []
+            for i in range(len(boxes)):
+                bx1, by1, bx2, by2 = boxes[i]
+                truncated = (
+                    (bx1 <= margin and x0 > 0)
+                    or (by1 <= margin and y0 > 0)
+                    or (bx2 >= (x1 - x0) - margin and x1 < width)
+                    or (by2 >= (y1 - y0) - margin and y1 < height)
+                )
+                if truncated:
+                    if RANGE_DEBUG:
+                        log.info(
+                            "[%s] range: dropped truncated %s %.2f at tile %d,%d",
+                            self._path,
+                            labels[i],
+                            confidence[i],
+                            x0,
+                            y0,
+                        )
+                    continue
+                keep_tile.append(i)
+            if not keep_tile:
+                continue
+            boxes = boxes[keep_tile]
             boxes[:, 0] += x0
             boxes[:, 2] += x0
             boxes[:, 1] += y0
             boxes[:, 3] += y0
             all_xyxy.append(boxes)
-            all_conf.append(
-                detections.confidence
-                if detections.confidence is not None
-                else np.zeros(len(detections))
-            )
-            all_labels.extend(labels)
+            all_conf.append(confidence[keep_tile])
+            all_labels.extend([labels[i] for i in keep_tile])
         if all_xyxy:
             merged = sv.Detections(
                 xyxy=np.concatenate(all_xyxy),
                 confidence=np.concatenate(all_conf),
             )
-            merged, all_labels = dedupe_class_aware(
-                merged, all_labels, RANGE_DEDUPE_IOU
-            )
+            merged, all_labels = dedupe_class_aware(merged, all_labels)
         else:
             merged = sv.Detections.empty()
+            all_labels = []
         with self._lock:
             self._detections = merged
             self._labels = all_labels
+            self._updated_at = time.time()
         log.info(
             "[%s] range pass: %d object(s) in full frame", self._path, len(merged)
         )
@@ -778,48 +879,44 @@ class StreamWorker(threading.Thread):
                 raw_count = len(detections)
 
                 # Merge long-range detections (full-res coords -> fast-frame
-                # coords). Re-fed every tick so range-found tracks stay alive
-                # between range passes; same-class overlaps are dropped.
+                # coords) and suppress duplicates ONCE, over the combined set,
+                # so the tracker only ever sees one box per physical object.
+                # Stale range results are skipped: their coordinates describe
+                # where the object was, and feeding them spawns a ghost track.
+                range_count = 0
                 if scanner is not None:
-                    range_dets, range_labels = scanner.latest()
-                    if range_dets is not None and len(range_dets) > 0:
-                        r_xyxy = range_dets.xyxy * scale
-                        r_conf = (
-                            range_dets.confidence
-                            if range_dets.confidence is not None
-                            else np.zeros(len(range_dets))
+                    range_dets, range_labels, range_at = scanner.latest()
+                    fresh = (now - range_at) <= RANGE_RESULT_MAX_AGE_SECONDS
+                    if range_dets is not None and len(range_dets) > 0 and fresh:
+                        range_count = len(range_dets)
+                        detections = sv.Detections(
+                            xyxy=np.concatenate(
+                                [detections.xyxy, range_dets.xyxy * scale]
+                            ),
+                            confidence=np.concatenate(
+                                [
+                                    detections.confidence
+                                    if detections.confidence is not None
+                                    else np.zeros(len(detections)),
+                                    range_dets.confidence
+                                    if range_dets.confidence is not None
+                                    else np.zeros(len(range_dets)),
+                                ]
+                            ),
                         )
-                        keep: list[int] = []
-                        for i in range(len(range_dets)):
-                            duplicate = False
-                            for j in range(len(detections)):
-                                if range_labels[i] != labels[j]:
-                                    continue
-                                if (
-                                    iou_matrix(
-                                        r_xyxy[i : i + 1], detections.xyxy[j : j + 1]
-                                    )[0, 0]
-                                    > RANGE_DEDUPE_IOU
-                                ):
-                                    duplicate = True
-                                    break
-                            if not duplicate:
-                                keep.append(i)
-                        if keep:
-                            detections = sv.Detections(
-                                xyxy=np.concatenate(
-                                    [detections.xyxy, r_xyxy[keep]]
-                                ),
-                                confidence=np.concatenate(
-                                    [
-                                        detections.confidence
-                                        if detections.confidence is not None
-                                        else np.zeros(len(detections)),
-                                        r_conf[keep],
-                                    ]
-                                ),
-                            )
-                            labels = labels + [range_labels[i] for i in keep]
+                        labels = labels + list(range_labels)
+
+                merged_count = len(detections)
+                detections, labels = dedupe_class_aware(detections, labels)
+                if RANGE_DEBUG:
+                    log.info(
+                        "[%s] sources: fast=%d range=%d merged=%d after-dedupe=%d",
+                        self.path,
+                        raw_count,
+                        range_count,
+                        merged_count,
+                        len(detections),
+                    )
 
                 detections = tracker.update_with_detections(
                     attach_labels(detections, labels)

@@ -42,16 +42,35 @@ primary_region = "ams"
 
   # YOLOv8n detection.
   DETECTION_FPS = "10"
-  DETECTION_CLASSES = "person,car,truck,bus,motorcycle,boat"
+  # COCO classes relevant from a drone; the UI filters which ones are drawn.
+  DETECTION_CLASSES = "person,bicycle,car,motorcycle,airplane,bus,train,truck,boat,bird,dog,horse,sheep,cow,kite,surfboard"
   # Deliberately low: the video dialog filters client-side with a sensitivity
   # slider, so the operator can raise sensitivity without a redeploy.
   DETECTION_CONFIDENCE = "0.20"
-  # Longest side used for inference — the biggest latency win on CPU.
-  INFER_MAX_SIDE = "480"
+  # Longest side used for the fast pass — balances speed and range.
+  INFER_MAX_SIDE = "640"
   # Analysed frames a lost track survives inside ByteTrack.
   TRACKER_LOST_BUFFER = "5"
   # Boxes disappear fast when an object leaves the frame.
   TRACK_TTL_SECONDS = "0.8"
+
+  # Long-range pass: tiled full-resolution analysis at a low cadence, merged
+  # into the same tracker. Catches small/distant objects the downscale loses.
+  RANGE_PASS_ENABLED = "true"
+  RANGE_PASS_INTERVAL_SECONDS = "2.0"
+  RANGE_TILE_COLS = "3"
+  RANGE_TILE_ROWS = "2"
+  RANGE_TILE_OVERLAP = "0.15"
+  RANGE_CONFIDENCE = "0.15"
+  RANGE_DEDUPE_IOU = "0.5"
+  # A tile only sees part of a large object, so its box lands INSIDE the
+  # full-frame box — low IoU, high containment. This is what removes the
+  # stacked duplicate boxes around one person.
+  RANGE_CONTAINMENT = "0.7"
+  # Range boxes older than this are not re-fed (0 = interval + 0.5s).
+  RANGE_RESULT_MAX_AGE_SECONDS = "0"
+  # Temporary: set to "true" to log per-source counts and each suppression.
+  RANGE_DEBUG = "false"
 
 [[vm]]
   # Dedicated CPU — on shared CPU the machine, not the code, caps the frame rate.
