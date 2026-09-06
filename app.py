@@ -21,11 +21,19 @@ CPU only. Everything is configured through environment variables:
   DISCOVERY_INTERVAL_SECONDS    how often we look for new streams, default 10
   SENSOR_STALE_SECONDS          a sensor counts as live for this long, default 300
   DETECTION_FPS                 analysed frames per second, default 10
-  DETECTION_CLASSES             default person,car,truck,bus,motorcycle,boat
+  DETECTION_CLASSES             default: person,bicycle,car,motorcycle,airplane,
+                                bus,train,truck,boat,bird,dog,horse,sheep,cow,
+                                kite,surfboard (any COCO class works)
   DETECTION_CONFIDENCE          default 0.20 (the UI filters further)
-  INFER_MAX_SIDE                downscale longest side before inference, default 480
+  INFER_MAX_SIDE                downscale longest side before inference, default 640
   TRACKER_LOST_BUFFER           analysed frames a lost track survives, default 5
   TRACK_TTL_SECONDS             default 0.8
+  RANGE_PASS_ENABLED            tiled full-res pass for small/distant objects
+  RANGE_PASS_INTERVAL_SECONDS   cadence of the range pass, default 2.0
+  RANGE_TILE_COLS / _ROWS       tile grid, default 3x2 with 15% overlap
+  RANGE_TILE_OVERLAP
+  RANGE_CONFIDENCE              separate threshold for the range pass, 0.15
+  RANGE_DEDUPE_IOU              overlap at which duplicate boxes are merged, 0.5
 """
 
 from __future__ import annotations
@@ -78,16 +86,33 @@ DETECTION_FPS = float(os.environ.get("DETECTION_FPS", "10") or 10)
 DETECTION_CONFIDENCE = float(os.environ.get("DETECTION_CONFIDENCE", "0.20") or 0.20)
 TRACK_TTL_SECONDS = float(os.environ.get("TRACK_TTL_SECONDS", "0.8") or 0.8)
 # Downscale before inference: the single biggest latency win on CPU. 0 = off.
-INFER_MAX_SIDE = int(os.environ.get("INFER_MAX_SIDE", "480") or 480)
+INFER_MAX_SIDE = int(os.environ.get("INFER_MAX_SIDE", "640") or 640)
 # How many analysed frames a lost track survives inside the tracker.
 TRACKER_LOST_BUFFER = int(os.environ.get("TRACKER_LOST_BUFFER", "5") or 5)
+DEFAULT_CLASSES = (
+    "person,bicycle,car,motorcycle,airplane,bus,train,truck,boat,"
+    "bird,dog,horse,sheep,cow,kite,surfboard"
+)
 DETECTION_CLASSES = [
     c.strip().lower()
-    for c in os.environ.get(
-        "DETECTION_CLASSES", "person,car,truck,bus,motorcycle,boat"
-    ).split(",")
+    for c in os.environ.get("DETECTION_CLASSES", DEFAULT_CLASSES).split(",")
     if c.strip()
 ]
+
+# Long-range pass: the full-resolution frame is tiled and analysed at a low
+# cadence to catch small, distant objects that vanish in the fast downscale.
+# Range detections are merged into the SAME tracker, so one object = one box.
+RANGE_PASS_ENABLED = os.environ.get("RANGE_PASS_ENABLED", "true").lower() != "false"
+RANGE_PASS_INTERVAL_SECONDS = float(
+    os.environ.get("RANGE_PASS_INTERVAL_SECONDS", "2.0") or 2.0
+)
+RANGE_TILE_COLS = int(os.environ.get("RANGE_TILE_COLS", "3") or 3)
+RANGE_TILE_ROWS = int(os.environ.get("RANGE_TILE_ROWS", "2") or 2)
+RANGE_TILE_OVERLAP = float(os.environ.get("RANGE_TILE_OVERLAP", "0.15") or 0.15)
+# Separate confidence for the range pass — small far objects score lower.
+RANGE_CONFIDENCE = float(os.environ.get("RANGE_CONFIDENCE", "0.15") or 0.15)
+# IoU at which a range box that overlaps a fast box of the same class is dropped.
+RANGE_DEDUPE_IOU = float(os.environ.get("RANGE_DEDUPE_IOU", "0.5") or 0.5)
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "yolov8n.pt")
 
@@ -211,13 +236,15 @@ class YoloDetector:
             f"confidence={DETECTION_CONFIDENCE} fps={DETECTION_FPS}"
         )
 
-    def detect(self, frame) -> tuple[sv.Detections, list[str]]:
+    def detect(
+        self, frame, conf: float | None = None
+    ) -> tuple[sv.Detections, list[str]]:
         # One model instance shared by all workers: serialise inference so two
         # streams cannot corrupt each other's state.
         with self._lock:
             result = self.model.predict(
                 frame,
-                conf=DETECTION_CONFIDENCE,
+                conf=conf if conf is not None else DETECTION_CONFIDENCE,
                 classes=sorted(self.class_ids.keys()),
                 verbose=False,
             )[0]
@@ -475,6 +502,160 @@ def build_rows(detections, session_id: str, width: int, height: int) -> list[dic
 
 
 # --------------------------------------------------------------------------- #
+# Long-range pass (tiled full-resolution analysis)
+# --------------------------------------------------------------------------- #
+
+
+def tile_offsets(width: int, height: int, cols: int, rows: int, overlap: float):
+    """Yield (x0, y0, x1, y1) tile windows covering the frame with overlap."""
+    base_w = max(1, width // cols)
+    base_h = max(1, height // rows)
+    step_x = max(1, int(base_w * (1.0 - overlap)))
+    step_y = max(1, int(base_h * (1.0 - overlap)))
+    for r in range(rows):
+        for c in range(cols):
+            x0 = min(c * step_x, max(0, width - base_w))
+            y0 = min(r * step_y, max(0, height - base_h))
+            yield x0, y0, x0 + base_w, y0 + base_h
+
+
+def iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Pairwise IoU between xyxy box arrays a (n) and b (m) -> (n, m)."""
+    if len(a) == 0 or len(b) == 0:
+        return np.zeros((len(a), len(b)))
+    ax1, ay1, ax2, ay2 = a[:, 0:1], a[:, 1:2], a[:, 2:3], a[:, 3:4]
+    bx1, by1, bx2, by2 = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+    inter_w = np.clip(np.minimum(ax2, bx2) - np.maximum(ax1, bx1), 0, None)
+    inter_h = np.clip(np.minimum(ay2, by2) - np.maximum(ay1, by1), 0, None)
+    inter = inter_w * inter_h
+    area_a = np.clip((ax2 - ax1) * (ay2 - ay1), 0, None)
+    area_b = np.clip((bx2 - bx1) * (by2 - by1), 0, None)
+    union = area_a + area_b - inter
+    return np.where(union > 0, inter / np.maximum(union, 1e-9), 0.0)
+
+
+def dedupe_class_aware(detections, labels: list[str], iou_thr: float):
+    """Drop lower-confidence duplicates of the same class (tile overlap)."""
+    if len(detections) <= 1:
+        return detections, labels
+    order = np.argsort(-detections.confidence)
+    keep: list[int] = []
+    boxes = detections.xyxy
+    for idx in order:
+        duplicate = False
+        for kept in keep:
+            if labels[kept] != labels[idx]:
+                continue
+            if iou_matrix(boxes[idx : idx + 1], boxes[kept : kept + 1])[0, 0] > iou_thr:
+                duplicate = True
+                break
+        if not duplicate:
+            keep.append(int(idx))
+    keep.sort()
+    if len(keep) == len(detections):
+        return detections, labels
+    return detections[keep], [labels[i] for i in keep]
+
+
+class RangeScanner:
+    """Background thread analysing the full-resolution frame in tiles.
+
+    Small, distant objects disappear when the fast pass downscales the frame.
+    This scanner tiles the full frame, runs YOLO per tile at a low cadence and
+    hands the boxes (full-resolution coordinates) to the stream worker, which
+    merges them into the shared tracker — one object still gets one box.
+    """
+
+    def __init__(self, path: str, detector, frame_source) -> None:
+        self._path = path
+        self._detector = detector
+        self._frame_source = frame_source  # callable -> full-res frame or None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._detections: sv.Detections | None = None
+        self._labels: list[str] = []
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name=f"range-{path}"
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def latest(self) -> tuple[sv.Detections | None, list[str]]:
+        with self._lock:
+            return self._detections, list(self._labels)
+
+    def _run(self) -> None:
+        log.info(
+            "[%s] range pass: %dx%d tiles every %.1fs",
+            self._path,
+            RANGE_TILE_COLS,
+            RANGE_TILE_ROWS,
+            RANGE_PASS_INTERVAL_SECONDS,
+        )
+        while not self._stop.is_set():
+            frame = self._frame_source()
+            if frame is None:
+                if self._stop.wait(0.2):
+                    break
+                continue
+            started = time.time()
+            try:
+                self._scan(frame)
+            except Exception as exc:
+                log.warning("[%s] range pass error: %s", self._path, exc)
+            elapsed = time.time() - started
+            remaining = RANGE_PASS_INTERVAL_SECONDS - elapsed
+            if self._stop.wait(max(0.1, remaining)):
+                break
+        log.info("[%s] range pass stopped", self._path)
+
+    def _scan(self, frame) -> None:
+        height, width = frame.shape[:2]
+        all_xyxy: list[np.ndarray] = []
+        all_conf: list[float] = []
+        all_labels: list[str] = []
+        for x0, y0, x1, y1 in tile_offsets(
+            width, height, RANGE_TILE_COLS, RANGE_TILE_ROWS, RANGE_TILE_OVERLAP
+        ):
+            tile = frame[y0:y1, x0:x1]
+            if tile.size == 0:
+                continue
+            detections, labels = self._detector.detect(tile, conf=RANGE_CONFIDENCE)
+            if len(detections) == 0:
+                continue
+            boxes = detections.xyxy.copy()
+            boxes[:, 0] += x0
+            boxes[:, 2] += x0
+            boxes[:, 1] += y0
+            boxes[:, 3] += y0
+            all_xyxy.append(boxes)
+            all_conf.append(
+                detections.confidence
+                if detections.confidence is not None
+                else np.zeros(len(detections))
+            )
+            all_labels.extend(labels)
+        if all_xyxy:
+            merged = sv.Detections(
+                xyxy=np.concatenate(all_xyxy),
+                confidence=np.concatenate(all_conf),
+            )
+            merged, all_labels = dedupe_class_aware(
+                merged, all_labels, RANGE_DEDUPE_IOU
+            )
+        else:
+            merged = sv.Detections.empty()
+        with self._lock:
+            self._detections = merged
+            self._labels = all_labels
+        log.info(
+            "[%s] range pass: %d object(s) in full frame", self._path, len(merged)
+        )
+
+
+# --------------------------------------------------------------------------- #
 # One worker per live stream
 # --------------------------------------------------------------------------- #
 
@@ -541,6 +722,18 @@ class StreamWorker(threading.Thread):
         last_seq = 0
         last_inference = 0.0
 
+        # Latest full-resolution frame, shared with the long-range scanner.
+        full_frame_slot: dict = {"frame": None, "seq": -1}
+
+        def latest_full_frame():
+            return full_frame_slot["frame"]
+
+        scanner = (
+            RangeScanner(self.path, self.detector, latest_full_frame)
+            if RANGE_PASS_ENABLED
+            else None
+        )
+
         try:
             while not self._stop.is_set():
                 frame, seq, error = grabber.latest()
@@ -562,8 +755,14 @@ class StreamWorker(threading.Thread):
                 if not src_w or not src_h:
                     continue
 
+                # Share the full-resolution frame with the range scanner before
+                # downscaling — that is where the small/distant objects live.
+                full_frame_slot["frame"] = frame
+                full_frame_slot["seq"] = seq
+
                 # Downscale before inference — boxes stay correct because they
                 # are normalised against the frame we actually analysed.
+                scale = 1.0
                 if INFER_MAX_SIDE and max(src_w, src_h) > INFER_MAX_SIDE:
                     scale = INFER_MAX_SIDE / float(max(src_w, src_h))
                     frame = cv2.resize(
@@ -576,8 +775,52 @@ class StreamWorker(threading.Thread):
                 started = time.time()
                 detections, labels = self.detector.detect(frame)
                 infer_ms = (time.time() - started) * 1000.0
-
                 raw_count = len(detections)
+
+                # Merge long-range detections (full-res coords -> fast-frame
+                # coords). Re-fed every tick so range-found tracks stay alive
+                # between range passes; same-class overlaps are dropped.
+                if scanner is not None:
+                    range_dets, range_labels = scanner.latest()
+                    if range_dets is not None and len(range_dets) > 0:
+                        r_xyxy = range_dets.xyxy * scale
+                        r_conf = (
+                            range_dets.confidence
+                            if range_dets.confidence is not None
+                            else np.zeros(len(range_dets))
+                        )
+                        keep: list[int] = []
+                        for i in range(len(range_dets)):
+                            duplicate = False
+                            for j in range(len(detections)):
+                                if range_labels[i] != labels[j]:
+                                    continue
+                                if (
+                                    iou_matrix(
+                                        r_xyxy[i : i + 1], detections.xyxy[j : j + 1]
+                                    )[0, 0]
+                                    > RANGE_DEDUPE_IOU
+                                ):
+                                    duplicate = True
+                                    break
+                            if not duplicate:
+                                keep.append(i)
+                        if keep:
+                            detections = sv.Detections(
+                                xyxy=np.concatenate(
+                                    [detections.xyxy, r_xyxy[keep]]
+                                ),
+                                confidence=np.concatenate(
+                                    [
+                                        detections.confidence
+                                        if detections.confidence is not None
+                                        else np.zeros(len(detections)),
+                                        r_conf[keep],
+                                    ]
+                                ),
+                            )
+                            labels = labels + [range_labels[i] for i in keep]
+
                 detections = tracker.update_with_detections(
                     attach_labels(detections, labels)
                 )
@@ -595,6 +838,8 @@ class StreamWorker(threading.Thread):
                 status.update(self.session_id, active_tracks=len(rows))
                 self.store.upsert(rows)
         finally:
+            if scanner is not None:
+                scanner.stop()
             grabber.stop()
             cap.release()
             status.update(self.session_id, connected=False, active_tracks=0)
