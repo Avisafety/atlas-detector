@@ -40,7 +40,7 @@ primary_region = "ams"
   DISCOVERY_INTERVAL_SECONDS = "10"
   SENSOR_STALE_SECONDS = "300"
 
-  # YOLOv8n detection.
+  # YOLO26n detection.
   DETECTION_FPS = "10"
   # COCO classes relevant from a drone; the UI filters which ones are drawn.
   DETECTION_CLASSES = "person,bicycle,car,motorcycle,airplane,bus,train,truck,boat,bird,dog,horse,sheep,cow,kite,surfboard"
