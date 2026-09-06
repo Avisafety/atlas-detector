@@ -1,44 +1,40 @@
 """atlas-detector — continuous object detection and tracking on Atlas drone video.
 
-Reads one MediaMTX stream over RTSP, runs a detector (YOLOv8n by default, or
-Grounding DINO for open-vocabulary text-prompted detection) plus ByteTrack on a
-subset of the frames, and upserts one row per tracked object into the Supabase
-table `atlas_detections` (unique on flight_session_id + track_id). A cleanup
-loop deletes tracks that stopped being updated.
+Discovers every active flight that has a live Atlas video stream, reads each
+stream over RTSP from MediaMTX, runs YOLOv8n + ByteTrack on a subset of the
+frames, and upserts one row per tracked object into the Supabase table
+`atlas_detections` (unique on flight_session_id + track_id). A cleanup loop
+deletes tracks that stopped being updated.
+
+No serial number is configured anywhere: the supervisor polls Supabase and
+starts/stops a worker per live stream, so any drone works out of the box.
 
 CPU only. Everything is configured through environment variables:
 
-  MEDIAMTX_RTSP_URL             rtsp://live-video.internal:8554/<serial>/<sensor>?detector=<secret>
+  RTSP_BASE_URL                 rtsp://live-video.internal:8554
+  DETECTOR_SHARED_SECRET        appended as ?detector=<secret> when reading
   SUPABASE_URL
   SUPABASE_SERVICE_ROLE_KEY
-  FLIGHT_SESSION_ID             active_flights.id the detections belong to
-  DETECTION_ENGINE              yolo (default) | grounding_dino
-  DETECTION_FPS                 analysis rate for yolo, default 10
-  DETECTION_FPS_GROUNDING_DINO  analysis rate for grounding_dino, default 0.2
-  DETECTION_CLASSES             yolo only, default person,car,truck,bus,motorcycle,boat
-  DETECTION_CONFIDENCE          yolo only, default 0.30
-  DETECTION_TEXT_PROMPT         grounding_dino only, "person . car . boat . ..."
-  DETECTION_BOX_THRESHOLD       grounding_dino only, default 0.25
-  DETECTION_TEXT_THRESHOLD      grounding_dino only, default 0.20
-  DETECTION_FPS_TILED           grounding_dino only, tiled pass rate, default 1.5
-  TILE_GRID                     tiled grid rows x cols, default 2x3
-  TILE_OVERLAP                  tile overlap fraction, default 0.15
+  MEDIAMTX_RTSP_URL             optional, pins one stream (manual testing)
+  FLIGHT_SESSION_ID             optional, required together with the URL above
+  MAX_STREAMS                   simultaneous workers, default 2
+  DISCOVERY_INTERVAL_SECONDS    how often we look for new streams, default 10
+  SENSOR_STALE_SECONDS          a sensor counts as live for this long, default 300
+  DETECTION_FPS                 analysed frames per second, default 10
+  DETECTION_CLASSES             default person,car,truck,bus,motorcycle,boat
+  DETECTION_CONFIDENCE          default 0.20 (the UI filters further)
   INFER_MAX_SIDE                downscale longest side before inference, default 480
   TRACKER_LOST_BUFFER           analysed frames a lost track survives, default 5
   TRACK_TTL_SECONDS             default 0.8
 """
 
-
 from __future__ import annotations
 
-import itertools
 import json
-
 import logging
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -58,18 +54,28 @@ log = logging.getLogger("atlas-detector")
 # Configuration
 # --------------------------------------------------------------------------- #
 
-RTSP_URL = os.environ.get("MEDIAMTX_RTSP_URL", "").strip()
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+
+RTSP_BASE_URL = (
+    os.environ.get("RTSP_BASE_URL", "rtsp://live-video.internal:8554").strip().rstrip("/")
+)
+DETECTOR_SHARED_SECRET = os.environ.get("DETECTOR_SHARED_SECRET", "").strip()
+
+# Optional manual override — pins the detector to a single stream for testing.
+RTSP_URL = os.environ.get("MEDIAMTX_RTSP_URL", "").strip()
 FLIGHT_SESSION_ID = os.environ.get("FLIGHT_SESSION_ID", "").strip()
 
-DETECTION_ENGINE = (os.environ.get("DETECTION_ENGINE", "yolo") or "yolo").strip().lower()
+MAX_STREAMS = int(os.environ.get("MAX_STREAMS", "2") or 2)
+DISCOVERY_INTERVAL_SECONDS = float(
+    os.environ.get("DISCOVERY_INTERVAL_SECONDS", "10") or 10
+)
+SENSOR_STALE_SECONDS = float(os.environ.get("SENSOR_STALE_SECONDS", "300") or 300)
 
 DETECTION_FPS = float(os.environ.get("DETECTION_FPS", "10") or 10)
-DETECTION_FPS_GROUNDING_DINO = float(
-    os.environ.get("DETECTION_FPS_GROUNDING_DINO", "0.2") or 0.2
-)
-DETECTION_CONFIDENCE = float(os.environ.get("DETECTION_CONFIDENCE", "0.30") or 0.30)
+# Written raw and low: the video dialog has a sensitivity slider that filters
+# client-side, so raising sensitivity never needs a redeploy.
+DETECTION_CONFIDENCE = float(os.environ.get("DETECTION_CONFIDENCE", "0.20") or 0.20)
 TRACK_TTL_SECONDS = float(os.environ.get("TRACK_TTL_SECONDS", "0.8") or 0.8)
 # Downscale before inference: the single biggest latency win on CPU. 0 = off.
 INFER_MAX_SIDE = int(os.environ.get("INFER_MAX_SIDE", "480") or 480)
@@ -83,70 +89,16 @@ DETECTION_CLASSES = [
     if c.strip()
 ]
 
-# Grounding DINO expects categories separated by " . ".
-DETECTION_TEXT_PROMPT = (
-    os.environ.get(
-        "DETECTION_TEXT_PROMPT", "person . car . boat . truck . bus . motorcycle"
-    ).strip()
-    or "person . car . boat . truck . bus . motorcycle"
-)
-DETECTION_BOX_THRESHOLD = float(os.environ.get("DETECTION_BOX_THRESHOLD", "0.25") or 0.25)
-DETECTION_TEXT_THRESHOLD = float(os.environ.get("DETECTION_TEXT_THRESHOLD", "0.20") or 0.20)
-
-# --- Tiled full-resolution pass (Grounding DINO only) ----------------------- #
-# Runs beside the fast downscaled pass and analyses overlapping full-resolution
-# tiles in parallel, so small/distant objects survive to the model.
-DETECTION_FPS_TILED = float(os.environ.get("DETECTION_FPS_TILED", "1.5") or 1.5)
-TILE_GRID = (os.environ.get("TILE_GRID", "2x3") or "2x3").strip().lower()
-TILE_OVERLAP = float(os.environ.get("TILE_OVERLAP", "0.15") or 0.15)
-TILE_IOU_THRESHOLD = float(os.environ.get("TILE_IOU_THRESHOLD", "0.5") or 0.5)
-
-# --- Search-and-track ROIs -------------------------------------------------- #
-# The tiled pass never writes rows: it only nominates regions of interest that
-# the fast pass then re-checks at full resolution, so a single tracker owns
-# every box and nothing is ever drawn twice.
-ROI_PADDING = float(os.environ.get("ROI_PADDING", "0.2") or 0.2)
-ROI_CONFIRM_FRAMES = int(os.environ.get("ROI_CONFIRM_FRAMES", "5") or 5)
-ROI_MISS_LIMIT = int(os.environ.get("ROI_MISS_LIMIT", "10") or 10)
-ROI_MAX = int(os.environ.get("ROI_MAX", "8") or 8)
-ROI_IOU_MATCH = float(os.environ.get("ROI_IOU_MATCH", "0.3") or 0.3)
-# PyTorch intra-op threads per inference (tiled pass shares the CPU budget).
-TORCH_THREADS = int(os.environ.get("TORCH_THREADS", "2") or 2)
-
-
-
-
-def _parse_grid(value: str) -> tuple[int, int]:
-    try:
-        rows, cols = value.split("x")
-        return max(1, int(rows)), max(1, int(cols))
-    except Exception:
-        log.warning("Invalid TILE_GRID '%s', falling back to 2x3", value)
-        return 2, 3
-
-
-TILE_ROWS, TILE_COLS = _parse_grid(TILE_GRID)
-
 MODEL_PATH = os.environ.get("MODEL_PATH", "yolov8n.pt")
-GROUNDING_DINO_CHECKPOINT = os.environ.get(
-    "GROUNDING_DINO_CHECKPOINT", "IDEA-Research/grounding-dino-tiny"
-)
 
 # Backoff bounds for reconnecting to MediaMTX.
 BACKOFF_MIN = 1.0
 BACKOFF_MAX = 30.0
 
+MIN_FRAME_INTERVAL = 1.0 / DETECTION_FPS if DETECTION_FPS > 0 else 0.2
+
 # Force TCP for RTSP — UDP is unreliable across the Fly private network.
 os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
-
-ANALYSIS_FPS = (
-    DETECTION_FPS_GROUNDING_DINO if DETECTION_ENGINE == "grounding_dino" else DETECTION_FPS
-)
-MIN_FRAME_INTERVAL = 1.0 / ANALYSIS_FPS if ANALYSIS_FPS > 0 else 0.2
-
-TILED_ENABLED = DETECTION_ENGINE == "grounding_dino" and DETECTION_FPS_TILED > 0
-TILED_FRAME_INTERVAL = 1.0 / DETECTION_FPS_TILED if DETECTION_FPS_TILED > 0 else 0.0
-
 
 
 # --------------------------------------------------------------------------- #
@@ -157,37 +109,48 @@ TILED_FRAME_INTERVAL = 1.0 / DETECTION_FPS_TILED if DETECTION_FPS_TILED > 0 else
 class Status:
     def __init__(self) -> None:
         self.lock = threading.Lock()
-        self.connected = False
-        self.last_frame_at: float | None = None
-        self.active_tracks = 0
-        self.active_rois = 0
-        self.reconnects = 0
+        self.streams: dict[str, dict] = {}
         self.started_at = time.time()
+
+    def update(self, session_id: str, **fields) -> None:
+        with self.lock:
+            entry = self.streams.setdefault(session_id, {})
+            entry.update(fields)
+
+    def remove(self, session_id: str) -> None:
+        with self.lock:
+            self.streams.pop(session_id, None)
 
     def snapshot(self) -> dict:
         with self.lock:
-            last = self.last_frame_at
+            streams = []
+            for session_id, entry in self.streams.items():
+                last = entry.get("last_frame_at")
+                streams.append(
+                    {
+                        "flight_session_id": session_id,
+                        "path": entry.get("path"),
+                        "connected": entry.get("connected", False),
+                        "active_tracks": entry.get("active_tracks", 0),
+                        "reconnects": entry.get("reconnects", 0),
+                        "last_frame_age_seconds": (
+                            None if last is None else round(time.time() - last, 2)
+                        ),
+                    }
+                )
             return {
                 "ok": True,
                 "service": "atlas-detector",
-                "connected": self.connected,
-                "last_frame_age_seconds": None if last is None else round(time.time() - last, 2),
-                "active_tracks": self.active_tracks,
-                "active_rois": self.active_rois,
-                "reconnects": self.reconnects,
-                "uptime_seconds": round(time.time() - self.started_at, 1),
-                "flight_session_id": FLIGHT_SESSION_ID or None,
-                "engine": DETECTION_ENGINE,
-                "detection_fps": ANALYSIS_FPS,
-                "tiled_enabled": TILED_ENABLED,
-                "tiled_fps": DETECTION_FPS_TILED if TILED_ENABLED else None,
-                "tile_grid": f"{TILE_ROWS}x{TILE_COLS}" if TILED_ENABLED else None,
+                "engine": "yolo",
+                "model": MODEL_PATH,
+                "detection_fps": DETECTION_FPS,
+                "confidence": DETECTION_CONFIDENCE,
                 "classes": DETECTION_CLASSES,
-                "text_prompt": (
-                    DETECTION_TEXT_PROMPT if DETECTION_ENGINE == "grounding_dino" else None
-                ),
+                "max_streams": MAX_STREAMS,
+                "active_streams": len(streams),
+                "streams": streams,
+                "uptime_seconds": round(time.time() - self.started_at, 1),
             }
-
 
 
 status = Status()
@@ -217,12 +180,12 @@ def start_health_server() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Detectors — both return (sv.Detections, list[str] labels aligned by index)
+# Detector
 # --------------------------------------------------------------------------- #
 
 
 class YoloDetector:
-    """YOLOv8n with a fixed COCO class list. Unchanged default behaviour."""
+    """YOLOv8n on a fixed COCO class list. Shared by every stream worker."""
 
     name = "yolo"
 
@@ -231,6 +194,7 @@ class YoloDetector:
 
         log.info("Loading YOLOv8n (%s)", MODEL_PATH)
         self.model = YOLO(MODEL_PATH)
+        self._lock = threading.Lock()
 
         names: dict[int, str] = {int(k): str(v).lower() for k, v in self.model.names.items()}
         self.class_ids = {cid: n for cid, n in names.items() if n in DETECTION_CLASSES}
@@ -244,16 +208,19 @@ class YoloDetector:
         return (
             f"engine=yolo model={MODEL_PATH} "
             f"classes={','.join(sorted(self.class_ids.values()))} "
-            f"confidence={DETECTION_CONFIDENCE} fps={ANALYSIS_FPS}"
+            f"confidence={DETECTION_CONFIDENCE} fps={DETECTION_FPS}"
         )
 
     def detect(self, frame) -> tuple[sv.Detections, list[str]]:
-        result = self.model.predict(
-            frame,
-            conf=DETECTION_CONFIDENCE,
-            classes=sorted(self.class_ids.keys()),
-            verbose=False,
-        )[0]
+        # One model instance shared by all workers: serialise inference so two
+        # streams cannot corrupt each other's state.
+        with self._lock:
+            result = self.model.predict(
+                frame,
+                conf=DETECTION_CONFIDENCE,
+                classes=sorted(self.class_ids.keys()),
+                verbose=False,
+            )[0]
         detections = sv.Detections.from_ultralytics(result)
         class_ids = (
             detections.class_id
@@ -264,375 +231,8 @@ class YoloDetector:
         return detections, labels
 
 
-class GroundingDinoDetector:
-    """Open-vocabulary detection driven by a free-text prompt (CPU, Swin-T)."""
-
-    name = "grounding_dino"
-
-    def __init__(self) -> None:
-        import torch
-        from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
-
-        self.torch = torch
-        log.info("Loading Grounding DINO (%s)", GROUNDING_DINO_CHECKPOINT)
-        self.processor = AutoProcessor.from_pretrained(GROUNDING_DINO_CHECKPOINT)
-        self.model = AutoModelForZeroShotObjectDetection.from_pretrained(
-            GROUNDING_DINO_CHECKPOINT
-        )
-        self.model.eval()
-        # Grounding DINO wants lowercase categories ending with a period.
-        prompt = DETECTION_TEXT_PROMPT.strip().lower()
-        self.prompt = prompt if prompt.endswith(".") else prompt + " ."
-
-        self._pool: ThreadPoolExecutor | None = None
-        if TILED_ENABLED:
-            # Never run more tiles at once than we have cores: an over-sized
-            # pool only makes every single inference slower and starves the
-            # fast pass. 2 intra-op threads keeps one inference from being
-            # pinned to a single core.
-            cpus = os.cpu_count() or 2
-            torch.set_num_threads(max(1, TORCH_THREADS))
-            workers = max(1, min(TILE_ROWS * TILE_COLS, max(1, cpus // max(1, TORCH_THREADS))))
-            self._pool = ThreadPoolExecutor(
-                max_workers=workers, thread_name_prefix="tile"
-            )
-            log.info("Tile pool: %d worker(s) on %d cpu(s)", workers, cpus)
-
-            log.info(
-                "Tiled pass enabled: grid=%dx%d overlap=%.2f fps=%.2f",
-                TILE_ROWS,
-                TILE_COLS,
-                TILE_OVERLAP,
-                DETECTION_FPS_TILED,
-            )
-
-    def describe(self) -> str:
-        return (
-            f"engine=grounding_dino checkpoint={GROUNDING_DINO_CHECKPOINT} "
-            f"prompt=\"{self.prompt}\" box_threshold={DETECTION_BOX_THRESHOLD} "
-            f"text_threshold={DETECTION_TEXT_THRESHOLD} fps={ANALYSIS_FPS} "
-            f"tiled={'on' if TILED_ENABLED else 'off'} "
-            f"tile_grid={TILE_ROWS}x{TILE_COLS} tile_overlap={TILE_OVERLAP} "
-            f"tile_fps={DETECTION_FPS_TILED}"
-        )
-
-    def _infer(self, image) -> tuple[np.ndarray, np.ndarray, list[str]]:
-        """Run the model on one BGR image. Returns (xyxy, scores, labels)."""
-        height, width = image.shape[:2]
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        inputs = self.processor(images=rgb, text=self.prompt, return_tensors="pt")
-        with self.torch.no_grad():
-            outputs = self.model(**inputs)
-
-        results = self.processor.post_process_grounded_object_detection(
-            outputs,
-            inputs.input_ids,
-            box_threshold=DETECTION_BOX_THRESHOLD,
-            text_threshold=DETECTION_TEXT_THRESHOLD,
-            target_sizes=[(height, width)],
-        )[0]
-
-        boxes = results["boxes"].cpu().numpy().astype(np.float32).reshape(-1, 4)
-        scores = results["scores"].cpu().numpy().astype(np.float32).reshape(-1)
-        labels = [str(t).strip().lower() for t in results.get("text_labels", results["labels"])]
-        return boxes, scores, labels
-
-    def detect(self, frame) -> tuple[sv.Detections, list[str]]:
-        boxes, scores, labels = self._infer(frame)
-        if len(boxes) == 0:
-            return sv.Detections.empty(), []
-        return (
-            sv.Detections(
-                xyxy=boxes,
-                confidence=scores,
-                class_id=np.zeros(len(boxes), dtype=int),
-            ),
-            labels,
-        )
-
-    def detect_tiled(self, frame) -> tuple[sv.Detections, list[str]]:
-        """Analyse overlapping full-resolution tiles in parallel.
-
-        Each tile keeps its native pixel density, so distant objects that the
-        downscaled fast pass loses are still large enough for the model.
-        """
-        if self._pool is None:
-            return sv.Detections.empty(), []
-
-        height, width = frame.shape[:2]
-        tiles = _tile_boxes(width, height, TILE_ROWS, TILE_COLS, TILE_OVERLAP)
-
-        def work(box: tuple[int, int, int, int]):
-            x0, y0, x1, y1 = box
-            crop = frame[y0:y1, x0:x1]
-            if crop.size == 0:
-                return np.zeros((0, 4), dtype=np.float32), np.zeros(0, dtype=np.float32), []
-            b, s, l = self._infer(crop)
-            if len(b):
-                b = b.copy()
-                b[:, [0, 2]] += x0
-                b[:, [1, 3]] += y0
-            return b, s, l
-
-        all_boxes: list[np.ndarray] = []
-        all_scores: list[np.ndarray] = []
-        all_labels: list[str] = []
-        for boxes, scores, labels in self._pool.map(work, tiles):
-            if len(boxes) == 0:
-                continue
-            all_boxes.append(boxes)
-            all_scores.append(scores)
-            all_labels.extend(labels)
-
-        if not all_boxes:
-            return sv.Detections.empty(), []
-
-        boxes = np.concatenate(all_boxes, axis=0)
-        scores = np.concatenate(all_scores, axis=0)
-        keep = _class_aware_nms(boxes, scores, all_labels, TILE_IOU_THRESHOLD)
-        boxes = boxes[keep]
-        scores = scores[keep]
-        labels = [all_labels[i] for i in keep]
-
-        # Clamp to the frame so tiles at the edges cannot report outside it.
-        boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, width)
-        boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, height)
-
-        return (
-            sv.Detections(
-                xyxy=boxes.astype(np.float32),
-                confidence=scores.astype(np.float32),
-                class_id=np.zeros(len(boxes), dtype=int),
-            ),
-            labels,
-        )
-
-
-def _tile_boxes(
-    width: int, height: int, rows: int, cols: int, overlap: float
-) -> list[tuple[int, int, int, int]]:
-    """Grid of overlapping (x0, y0, x1, y1) tiles covering the whole frame."""
-    tile_w = width / cols
-    tile_h = height / rows
-    pad_x = tile_w * overlap
-    pad_y = tile_h * overlap
-    boxes: list[tuple[int, int, int, int]] = []
-    for r in range(rows):
-        for c in range(cols):
-            x0 = int(max(0, round(c * tile_w - pad_x)))
-            y0 = int(max(0, round(r * tile_h - pad_y)))
-            x1 = int(min(width, round((c + 1) * tile_w + pad_x)))
-            y1 = int(min(height, round((r + 1) * tile_h + pad_y)))
-            if x1 > x0 and y1 > y0:
-                boxes.append((x0, y0, x1, y1))
-    return boxes
-
-
-def _class_aware_nms(
-    boxes: np.ndarray, scores: np.ndarray, labels: list[str], iou_threshold: float
-) -> list[int]:
-    """Greedy NMS per label — removes duplicates from tile overlap regions."""
-    order = sorted(range(len(boxes)), key=lambda i: float(scores[i]), reverse=True)
-    keep: list[int] = []
-    for idx in order:
-        drop = False
-        for kept in keep:
-            if labels[kept] != labels[idx]:
-                continue
-            if _iou(boxes[idx], boxes[kept]) > iou_threshold:
-                drop = True
-                break
-        if not drop:
-            keep.append(idx)
-    return sorted(keep)
-
-
-def _iou(a: np.ndarray, b: np.ndarray) -> float:
-    ix0 = max(float(a[0]), float(b[0]))
-    iy0 = max(float(a[1]), float(b[1]))
-    ix1 = min(float(a[2]), float(b[2]))
-    iy1 = min(float(a[3]), float(b[3]))
-    iw = max(0.0, ix1 - ix0)
-    ih = max(0.0, iy1 - iy0)
-    inter = iw * ih
-    if inter <= 0:
-        return 0.0
-    area_a = max(0.0, float(a[2] - a[0])) * max(0.0, float(a[3] - a[1]))
-    area_b = max(0.0, float(b[2] - b[0])) * max(0.0, float(b[3] - b[1]))
-    union = area_a + area_b - inter
-    return inter / union if union > 0 else 0.0
-
-
 # --------------------------------------------------------------------------- #
-# Search-and-track: shared regions of interest
-# --------------------------------------------------------------------------- #
-
-
-def _pad_box(
-    box, width: int, height: int, padding: float
-) -> tuple[int, int, int, int]:
-    """Grow a box by `padding` on each side, clamped to the frame."""
-    x0, y0, x1, y1 = (float(v) for v in box)
-    pad_x = (x1 - x0) * padding
-    pad_y = (y1 - y0) * padding
-    return (
-        int(max(0, round(x0 - pad_x))),
-        int(max(0, round(y0 - pad_y))),
-        int(min(width, round(x1 + pad_x))),
-        int(min(height, round(y1 + pad_y))),
-    )
-
-
-class RoiRegistry:
-    """Thread-safe set of regions the tiled pass wants re-checked up close.
-
-    The tiled thread writes candidates; the fast loop reads them, crops them at
-    full resolution and reports hits/misses so a region retires once the main
-    tracker owns the object (or once it turns out to be nothing).
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._rois: list[dict] = []
-        self._last_boxes: np.ndarray = np.zeros((0, 4), dtype=np.float32)
-
-    # -- fast pass ---------------------------------------------------------- #
-
-    def snapshot(self) -> list[dict]:
-        with self._lock:
-            return [dict(r) for r in self._rois]
-
-    def set_last_boxes(self, boxes: np.ndarray) -> None:
-        """Boxes the fast pass just tracked, in full-frame coordinates."""
-        with self._lock:
-            self._last_boxes = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
-
-    def report(self, results: dict[int, bool]) -> int:
-        """Record per-ROI hit/miss and drop the ones that are done."""
-        with self._lock:
-            kept: list[dict] = []
-            for roi in self._rois:
-                outcome = results.get(roi["id"])
-                if outcome is True:
-                    roi["hits"] += 1
-                    roi["misses"] = 0
-                elif outcome is False:
-                    roi["misses"] += 1
-                if roi["hits"] >= ROI_CONFIRM_FRAMES:
-                    continue  # the main tracker owns this object now
-                if roi["misses"] >= ROI_MISS_LIMIT:
-                    continue  # false lead or the object left
-                kept.append(roi)
-            self._rois = kept
-            return len(self._rois)
-
-    # -- tiled pass --------------------------------------------------------- #
-
-    def add_candidates(self, boxes: np.ndarray, width: int, height: int) -> int:
-        """Add tiled hits that no ROI and no tracked box already covers."""
-        added = 0
-        with self._lock:
-            known = [np.array(r["box"], dtype=np.float32) for r in self._rois]
-            known.extend(self._last_boxes)
-            for box in np.asarray(boxes, dtype=np.float32).reshape(-1, 4):
-                if len(self._rois) >= ROI_MAX:
-                    break
-                if any(_iou(box, other) > ROI_IOU_MATCH for other in known):
-                    continue
-                padded = _pad_box(box, width, height, ROI_PADDING)
-                if padded[2] <= padded[0] or padded[3] <= padded[1]:
-                    continue
-                roi = {
-                    "id": next(self._counter),
-                    "box": padded,
-                    "added_at": time.time(),
-                    "hits": 0,
-                    "misses": 0,
-                }
-                self._rois.append(roi)
-                known.append(np.array(padded, dtype=np.float32))
-                added += 1
-            return added
-
-    _counter = itertools.count(1)
-
-
-def detect_in_rois(detector, frame, rois: list[dict], pool):
-    """Run the detector on each ROI crop at native resolution.
-
-    Returns (boxes in full-frame coordinates, scores, labels, per-ROI outcome).
-    """
-    if not rois:
-        return (
-            np.zeros((0, 4), dtype=np.float32),
-            np.zeros(0, dtype=np.float32),
-            [],
-            {},
-        )
-
-    def work(roi: dict):
-        x0, y0, x1, y1 = roi["box"]
-        crop = frame[y0:y1, x0:x1]
-        if crop.size == 0:
-            return roi["id"], np.zeros((0, 4), dtype=np.float32), np.zeros(0), []
-        detections, labels = detector.detect(crop)
-        boxes = np.asarray(detections.xyxy, dtype=np.float32).reshape(-1, 4)
-        scores = (
-            np.asarray(detections.confidence, dtype=np.float32)
-            if detections.confidence is not None
-            else np.zeros(len(boxes), dtype=np.float32)
-        )
-        if len(boxes):
-            boxes = boxes.copy()
-            boxes[:, [0, 2]] += x0
-            boxes[:, [1, 3]] += y0
-        return roi["id"], boxes, scores, labels
-
-    if pool is not None and len(rois) > 1:
-        results = list(pool.map(work, rois))
-    else:
-        results = [work(roi) for roi in rois]
-
-    all_boxes: list[np.ndarray] = []
-    all_scores: list[np.ndarray] = []
-    all_labels: list[str] = []
-    outcome: dict[int, bool] = {}
-    for roi_id, boxes, scores, labels in results:
-        outcome[roi_id] = len(boxes) > 0
-        if len(boxes) == 0:
-            continue
-        all_boxes.append(boxes)
-        all_scores.append(np.asarray(scores, dtype=np.float32).reshape(-1))
-        all_labels.extend(labels)
-
-    if not all_boxes:
-        return (
-            np.zeros((0, 4), dtype=np.float32),
-            np.zeros(0, dtype=np.float32),
-            [],
-            outcome,
-        )
-    return (
-        np.concatenate(all_boxes, axis=0),
-        np.concatenate(all_scores, axis=0),
-        all_labels,
-        outcome,
-    )
-
-
-
-def build_detector():
-    if DETECTION_ENGINE == "yolo":
-        return YoloDetector()
-    if DETECTION_ENGINE == "grounding_dino":
-        return GroundingDinoDetector()
-    raise SystemExit(
-        f"Unknown DETECTION_ENGINE '{DETECTION_ENGINE}' — use 'yolo' or 'grounding_dino'"
-    )
-
-
-# --------------------------------------------------------------------------- #
-# Supabase writer
+# Supabase
 # --------------------------------------------------------------------------- #
 
 
@@ -641,6 +241,8 @@ class DetectionStore:
 
     def __init__(self) -> None:
         self.client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+    # -- detections --------------------------------------------------------- #
 
     def upsert(self, rows: list[dict]) -> None:
         if not rows:
@@ -652,40 +254,101 @@ class DetectionStore:
         except Exception as exc:  # never let a write error kill the loop
             log.warning("Upsert failed: %s", exc)
 
-    def prune(self) -> None:
-        now = datetime.now(timezone.utc)
-        cutoff = (now - timedelta(seconds=TRACK_TTL_SECONDS)).isoformat()
+    def prune(self, session_ids: list[str]) -> None:
+        if not session_ids:
+            return
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=TRACK_TTL_SECONDS)
+        ).isoformat()
         try:
-            # One tracker, one freshness window: every row comes from the fast
-            # pass and refreshes at the same rate.
-            self.client.table("atlas_detections").delete().eq(
-                "flight_session_id", FLIGHT_SESSION_ID
+            self.client.table("atlas_detections").delete().in_(
+                "flight_session_id", session_ids
             ).lt("updated_at", cutoff).execute()
         except Exception as exc:
             log.warning("Prune failed: %s", exc)
 
-
-    def clear(self) -> None:
+    def clear(self, session_id: str) -> None:
         try:
             self.client.table("atlas_detections").delete().eq(
-                "flight_session_id", FLIGHT_SESSION_ID
+                "flight_session_id", session_id
             ).execute()
         except Exception as exc:
             log.warning("Clear failed: %s", exc)
 
+    # -- discovery ---------------------------------------------------------- #
 
-def cleanup_loop(store: DetectionStore) -> None:
-    while True:
-        # Sweep at least twice per TTL so boxes vanish quickly after an object
-        # leaves the frame, with a 0.4s floor to keep write volume sane.
-        time.sleep(max(0.4, TRACK_TTL_SECONDS / 2))
-        store.prune()
+    def live_streams(self) -> list[dict]:
+        """Active flights that currently have an Atlas video stream.
 
+        A flight qualifies when its drone has registered at least one sensor
+        through /atlas-video-endpoint recently. EO (sensor 1) wins when the
+        drone publishes both, since that is what the UI opens by default.
+        """
+        try:
+            flights = (
+                self.client.table("active_flights")
+                .select("id, drone_id")
+                .not_.is_("drone_id", "null")
+                .execute()
+                .data
+                or []
+            )
+        except Exception as exc:
+            log.warning("Discovery failed (active_flights): %s", exc)
+            return []
+
+        drone_ids = sorted({f["drone_id"] for f in flights if f.get("drone_id")})
+        if not drone_ids:
+            return []
+
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=SENSOR_STALE_SECONDS)
+        ).isoformat()
+        try:
+            sensors = (
+                self.client.table("atlas_drone_sensors")
+                .select("drone_id, serial, sensor, last_seen_at")
+                .in_("drone_id", drone_ids)
+                .gte("last_seen_at", cutoff)
+                .execute()
+                .data
+                or []
+            )
+        except Exception as exc:
+            log.warning("Discovery failed (atlas_drone_sensors): %s", exc)
+            return []
+
+        by_drone: dict[str, dict] = {}
+        for row in sensors:
+            current = by_drone.get(row["drone_id"])
+            # Prefer EO (1), otherwise the lowest sensor number available.
+            if current is None or int(row["sensor"]) < int(current["sensor"]):
+                by_drone[row["drone_id"]] = row
+
+        streams = []
+        for flight in flights:
+            sensor = by_drone.get(flight.get("drone_id"))
+            if not sensor:
+                continue
+            streams.append(
+                {
+                    "flight_session_id": flight["id"],
+                    "path": f"{sensor['serial']}/{int(sensor['sensor'])}",
+                }
+            )
+        return streams
 
 
 # --------------------------------------------------------------------------- #
-# Detection loop
+# Video capture
 # --------------------------------------------------------------------------- #
+
+
+def rtsp_url_for(path: str) -> str:
+    url = f"{RTSP_BASE_URL}/{path}"
+    if DETECTOR_SHARED_SECRET:
+        url = f"{url}?detector={DETECTOR_SHARED_SECRET}"
+    return url
 
 
 def open_capture(url: str) -> cv2.VideoCapture | None:
@@ -748,23 +411,18 @@ class FrameGrabber:
         self._stop.set()
 
 
-def _fallback_track_id(label: str, box, width: int, height: int) -> int:
-    """Stable id for an untracked detection, derived from class + position.
-
-    A coarse 32x32 grid cell means the same object keeps the same id across
-    frames as long as it does not move far, so the row is updated rather than
-    duplicated.
-    """
-    cx = (float(box[0]) + float(box[2])) / 2.0
-    cy = (float(box[1]) + float(box[3])) / 2.0
-    gx = int(max(0, min(31, cx / max(1, width) * 32)))
-    gy = int(max(0, min(31, cy / max(1, height) * 32)))
-    base = abs(hash((label, gx, gy))) % 500_000
-    return 500_000 + base
+# --------------------------------------------------------------------------- #
+# Detection rows
+# --------------------------------------------------------------------------- #
 
 
-def build_rows(detections, width: int, height: int) -> list[dict]:
+def attach_labels(detections, labels: list[str]):
+    detections.data = dict(detections.data or {})
+    detections.data["label"] = np.array(labels, dtype=object)
+    return detections
 
+
+def build_rows(detections, session_id: str, width: int, height: int) -> list[dict]:
     """Turn tracked detections into atlas_detections rows (normalised boxes)."""
     tracked_labels = detections.data.get("label") if detections.data else None
     timestamp = datetime.now(timezone.utc).isoformat()
@@ -800,7 +458,7 @@ def build_rows(detections, width: int, height: int) -> list[dict]:
         nh = max(0.0, min(1.0 - ny, (y2 - y1) / height))
         rows.append(
             {
-                "flight_session_id": FLIGHT_SESSION_ID,
+                "flight_session_id": session_id,
                 "track_id": int(track_id),
                 "object_class": name,
                 "confidence": round(float(conf), 4),
@@ -816,280 +474,212 @@ def build_rows(detections, width: int, height: int) -> list[dict]:
     return rows
 
 
-def attach_labels(detections, labels: list[str]):
-    detections.data = dict(detections.data or {})
-    detections.data["label"] = np.array(labels, dtype=object)
-    return detections
+# --------------------------------------------------------------------------- #
+# One worker per live stream
+# --------------------------------------------------------------------------- #
 
 
-def tiled_worker(detector, rois: RoiRegistry, grabber, stop: threading.Event) -> None:
-    """Slow, full-resolution tiled scout — runs beside the fast pass.
+class StreamWorker(threading.Thread):
+    """Analyses a single RTSP stream until it is asked to stop."""
 
-    It never writes to the database: every hit that is not already covered by a
-    tracked box or an existing ROI becomes a new region for the fast pass to
-    inspect up close, so a single tracker owns all output.
-    """
-    while not stop.is_set():
-        started = time.time()
-        frame, _, error = grabber.latest()
-        if error or frame is None:
-            stop.wait(0.2)
-            continue
-        height, width = frame.shape[:2]
-        if not width or not height:
-            stop.wait(0.2)
-            continue
-        try:
-            detections, _labels = detector.detect_tiled(frame)
-            boxes = np.asarray(detections.xyxy, dtype=np.float32).reshape(-1, 4)
-            added = rois.add_candidates(boxes, width, height)
-            log.info(
-                "tiled scout: %d hit(s), %d new ROI(s) in %.0f ms",
-                len(boxes),
-                added,
-                (time.time() - started) * 1000.0,
+    def __init__(self, session_id: str, path: str, detector, store: DetectionStore) -> None:
+        super().__init__(daemon=True, name=f"stream-{path}")
+        self.session_id = session_id
+        self.path = path
+        self.detector = detector
+        self.store = store
+        self.url = RTSP_URL if RTSP_URL else rtsp_url_for(path)
+        self._stop = threading.Event()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    # -- main loop ---------------------------------------------------------- #
+
+    def run(self) -> None:
+        log.info("[%s] worker started (%s)", self.path, self.session_id)
+        status.update(self.session_id, path=self.path, connected=False, reconnects=0)
+        backoff = BACKOFF_MIN
+        reconnects = 0
+        while not self._stop.is_set():
+            try:
+                self._run_once()
+                log.warning("[%s] stream ended", self.path)
+            except Exception as exc:
+                log.warning("[%s] stream error: %s", self.path, exc)
+
+            # Drop stale boxes immediately so the UI never shows frozen overlays.
+            self.store.clear(self.session_id)
+            reconnects += 1
+            status.update(
+                self.session_id, connected=False, active_tracks=0, reconnects=reconnects
             )
-        except Exception as exc:
-            log.warning("Tiled pass failed: %s", exc)
-        elapsed = time.time() - started
-        stop.wait(max(0.05, TILED_FRAME_INTERVAL - elapsed))
+            if self._stop.wait(backoff):
+                break
+            backoff = min(BACKOFF_MAX, backoff * 2)
 
+        self.store.clear(self.session_id)
+        status.remove(self.session_id)
+        log.info("[%s] worker stopped", self.path)
 
+    def _run_once(self) -> None:
+        cap = open_capture(self.url)
+        if cap is None:
+            raise ConnectionError("could not open RTSP stream")
 
-def run_stream(detector, store: DetectionStore) -> None:
-    """One connection attempt. Returns when the stream drops."""
-    cap = open_capture(RTSP_URL)
-    if cap is None:
-        raise ConnectionError("could not open RTSP stream")
+        status.update(self.session_id, connected=True)
+        log.info("[%s] connected", self.path)
 
-    with status.lock:
-        status.connected = True
-    log.info("Connected to stream")
-
-    # Fast-reacting tracker: short memory for lost tracks and a frame rate that
-    # matches the actual analysis rate, so positions are not extrapolated far.
-    tracker = sv.ByteTrack(
-        lost_track_buffer=TRACKER_LOST_BUFFER,
-        frame_rate=max(1, int(round(ANALYSIS_FPS))),
-        track_activation_threshold=min(0.25, DETECTION_BOX_THRESHOLD if DETECTION_ENGINE == "grounding_dino" else DETECTION_CONFIDENCE),
-    )
-    grabber = FrameGrabber(cap)
-    last_seq = 0
-    last_inference = 0.0
-
-    tiled_stop = threading.Event()
-    tiled_thread: threading.Thread | None = None
-    roi_registry: RoiRegistry | None = None
-    pool = getattr(detector, "_pool", None)
-    if TILED_ENABLED and hasattr(detector, "detect_tiled"):
-        roi_registry = RoiRegistry()
-        tiled_thread = threading.Thread(
-            target=tiled_worker,
-            args=(detector, roi_registry, grabber, tiled_stop),
-            daemon=True,
-            name="tiled",
+        # Fast-reacting tracker: short memory for lost tracks and a frame rate
+        # that matches the actual analysis rate.
+        tracker = sv.ByteTrack(
+            lost_track_buffer=TRACKER_LOST_BUFFER,
+            frame_rate=max(1, int(round(DETECTION_FPS))),
+            track_activation_threshold=min(0.25, DETECTION_CONFIDENCE),
         )
-        tiled_thread.start()
+        grabber = FrameGrabber(cap)
+        last_seq = 0
+        last_inference = 0.0
 
-    try:
+        try:
+            while not self._stop.is_set():
+                frame, seq, error = grabber.latest()
+                if error:
+                    raise ConnectionError(error)
+                if frame is None or seq == last_seq:
+                    time.sleep(0.02)
+                    continue
+
+                now = time.time()
+                if now - last_inference < MIN_FRAME_INTERVAL:
+                    time.sleep(min(0.02, MIN_FRAME_INTERVAL))
+                    continue
+                last_seq = seq
+                last_inference = now
+                status.update(self.session_id, last_frame_at=now)
+
+                src_h, src_w = frame.shape[:2]
+                if not src_w or not src_h:
+                    continue
+
+                # Downscale before inference — boxes stay correct because they
+                # are normalised against the frame we actually analysed.
+                if INFER_MAX_SIDE and max(src_w, src_h) > INFER_MAX_SIDE:
+                    scale = INFER_MAX_SIDE / float(max(src_w, src_h))
+                    frame = cv2.resize(
+                        frame,
+                        (max(1, int(src_w * scale)), max(1, int(src_h * scale))),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                height, width = frame.shape[:2]
+
+                started = time.time()
+                detections, labels = self.detector.detect(frame)
+                infer_ms = (time.time() - started) * 1000.0
+
+                raw_count = len(detections)
+                detections = tracker.update_with_detections(
+                    attach_labels(detections, labels)
+                )
+                rows = build_rows(detections, self.session_id, width, height)
+
+                log.info(
+                    "[%s] %d raw -> %d tracked -> %d row(s) in %.0f ms",
+                    self.path,
+                    raw_count,
+                    len(detections),
+                    len(rows),
+                    infer_ms,
+                )
+
+                status.update(self.session_id, active_tracks=len(rows))
+                self.store.upsert(rows)
+        finally:
+            grabber.stop()
+            cap.release()
+            status.update(self.session_id, connected=False, active_tracks=0)
+
+
+# --------------------------------------------------------------------------- #
+# Supervisor
+# --------------------------------------------------------------------------- #
+
+
+def cleanup_loop(store: DetectionStore, workers: dict[str, StreamWorker]) -> None:
+    while True:
+        # Sweep at least twice per TTL so boxes vanish quickly after an object
+        # leaves the frame, with a 0.4s floor to keep write volume sane.
+        time.sleep(max(0.4, TRACK_TTL_SECONDS / 2))
+        store.prune(list(workers.keys()))
+
+
+def supervise(detector, store: DetectionStore) -> None:
+    """Start a worker per live stream, stop workers whose flight ended."""
+    workers: dict[str, StreamWorker] = {}
+    threading.Thread(
+        target=cleanup_loop, args=(store, workers), daemon=True, name="cleanup"
+    ).start()
+
+    if RTSP_URL and FLIGHT_SESSION_ID:
+        log.info("Pinned to %s (MEDIAMTX_RTSP_URL override)", FLIGHT_SESSION_ID)
+        worker = StreamWorker(FLIGHT_SESSION_ID, "manual", detector, store)
+        workers[FLIGHT_SESSION_ID] = worker
+        worker.start()
         while True:
-            frame, seq, error = grabber.latest()
-            if error:
-                raise ConnectionError(error)
-            if frame is None or seq == last_seq:
-                # No new frame yet — wait briefly instead of re-analysing.
-                time.sleep(0.02)
+            time.sleep(DISCOVERY_INTERVAL_SECONDS)
+
+    while True:
+        streams = store.live_streams()
+        wanted = {s["flight_session_id"]: s["path"] for s in streams}
+
+        for session_id, worker in list(workers.items()):
+            if session_id not in wanted or not worker.is_alive():
+                log.info("Stopping worker for %s", session_id)
+                worker.stop()
+                workers.pop(session_id, None)
+
+        for session_id, path in wanted.items():
+            if session_id in workers:
                 continue
-
-            now = time.time()
-            # Pace inference to the engine's analysis rate, but always on the
-            # newest available frame (never on a queued, stale one).
-            if now - last_inference < MIN_FRAME_INTERVAL:
-                time.sleep(min(0.02, MIN_FRAME_INTERVAL))
-                continue
-            last_seq = seq
-            last_inference = now
-            with status.lock:
-                status.last_frame_at = now
-            source = frame
-            src_h, src_w = frame.shape[:2]
-            if not src_w or not src_h:
-                continue
-
-            # Downscale before inference — boxes stay correct because they are
-            # normalised against the frame we actually analysed.
-            scale = 1.0
-            if INFER_MAX_SIDE and max(src_w, src_h) > INFER_MAX_SIDE:
-                scale = INFER_MAX_SIDE / float(max(src_w, src_h))
-                frame = cv2.resize(
-                    frame,
-                    (max(1, int(src_w * scale)), max(1, int(src_h * scale))),
-                    interpolation=cv2.INTER_LINEAR,
+            if len(workers) >= MAX_STREAMS:
+                log.warning(
+                    "MAX_STREAMS=%d reached — not analysing %s", MAX_STREAMS, path
                 )
-            height, width = frame.shape[:2]
+                break
+            worker = StreamWorker(session_id, path, detector, store)
+            workers[session_id] = worker
+            worker.start()
 
-            infer_started = time.time()
-            detections, labels = detector.detect(frame)
-            infer_ms = (time.time() - infer_started) * 1000.0
-
-
-            if roi_registry is not None:
-                active = roi_registry.snapshot()
-                boxes = np.asarray(detections.xyxy, dtype=np.float32).reshape(-1, 4)
-                scores = (
-                    np.asarray(detections.confidence, dtype=np.float32).reshape(-1)
-                    if detections.confidence is not None
-                    else np.zeros(len(boxes), dtype=np.float32)
-                )
-                labels = list(labels)
-                if active:
-                    # Full-resolution crops of the regions the scout flagged.
-                    rb, rs, rl, outcome = detect_in_rois(
-                        detector, source, active, pool
-                    )
-                    remaining = roi_registry.report(outcome)
-                    with status.lock:
-                        status.active_rois = remaining
-                    if len(rb):
-                        # ROI boxes are full-frame; bring them into the same
-                        # (downscaled) coordinate space as the main pass.
-                        rb = rb * scale
-                        boxes = np.concatenate([boxes, rb], axis=0)
-                        scores = np.concatenate([scores, rs], axis=0)
-                        labels.extend(rl)
-
-                if len(boxes):
-                    keep = _class_aware_nms(boxes, scores, labels, TILE_IOU_THRESHOLD)
-                    boxes = boxes[keep]
-                    scores = scores[keep]
-                    labels = [labels[i] for i in keep]
-                    detections = sv.Detections(
-                        xyxy=boxes.astype(np.float32),
-                        confidence=scores.astype(np.float32),
-                        class_id=np.zeros(len(boxes), dtype=int),
-                    )
-                else:
-                    detections = sv.Detections.empty()
-
-            raw_count = len(detections)
-            raw_labels = list(labels)
-            raw_boxes = np.asarray(detections.xyxy, dtype=np.float32).reshape(-1, 4)
-            raw_scores = (
-                np.asarray(detections.confidence, dtype=np.float32).reshape(-1)
-                if detections.confidence is not None
-                else np.zeros(raw_count, dtype=np.float32)
-            )
-
-            # Keep the label list index-aligned with the detections we track.
-            detections = tracker.update_with_detections(attach_labels(detections, labels))
-            rows = build_rows(detections, width, height)
-
-            # At low analysis rates ByteTrack only emits a track once it has
-            # been matched on a second frame, so slow engines (Grounding DINO)
-            # can detect objects continuously and still write nothing. Fall
-            # back to the raw detections with stable, position-derived ids.
-            if not rows and raw_count:
-                rows = build_rows(
-                    attach_labels(
-                        sv.Detections(
-                            xyxy=raw_boxes,
-                            confidence=raw_scores,
-                            class_id=np.zeros(raw_count, dtype=int),
-                            tracker_id=np.array(
-                                [
-                                    _fallback_track_id(raw_labels[i] if i < len(raw_labels) else "", raw_boxes[i], width, height)
-                                    for i in range(raw_count)
-                                ],
-                                dtype=int,
-                            ),
-                        ),
-                        raw_labels,
-                    ),
-                    width,
-                    height,
-                )
-
-            log.info(
-                "fast pass: %d raw -> %d tracked -> %d row(s) in %.0f ms (labels=%s)",
-                raw_count,
-                len(detections),
-                len(rows),
-                infer_ms,
-                raw_labels[:6],
-            )
-
-
-            if roi_registry is not None:
-                tracked = np.asarray(detections.xyxy, dtype=np.float32).reshape(-1, 4)
-                roi_registry.set_last_boxes(
-                    tracked / scale if scale != 1.0 else tracked
-                )
-
-            with status.lock:
-                status.active_tracks = len(rows)
-
-            store.upsert(rows)
-    finally:
-        tiled_stop.set()
-        if tiled_thread is not None:
-            tiled_thread.join(timeout=5)
-        grabber.stop()
-        cap.release()
-
-        with status.lock:
-            status.connected = False
-            status.active_tracks = 0
-            status.active_rois = 0
-
-
+        time.sleep(DISCOVERY_INTERVAL_SECONDS)
 
 
 def main() -> None:
     missing = [
         name
         for name, value in (
-            ("MEDIAMTX_RTSP_URL", RTSP_URL),
             ("SUPABASE_URL", SUPABASE_URL),
             ("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY),
-            ("FLIGHT_SESSION_ID", FLIGHT_SESSION_ID),
         )
         if not value
     ]
     if missing:
         raise SystemExit(f"Missing required environment variables: {', '.join(missing)}")
+    if RTSP_URL and not FLIGHT_SESSION_ID:
+        raise SystemExit("MEDIAMTX_RTSP_URL requires FLIGHT_SESSION_ID")
 
     start_health_server()
 
-    detector = build_detector()
-    log.info("ACTIVE DETECTION ENGINE: %s", detector.name)
+    detector = YoloDetector()
     log.info("Detector config: %s", detector.describe())
+    log.info(
+        "Auto-discovery every %.0fs from %s (max %d stream(s))",
+        DISCOVERY_INTERVAL_SECONDS,
+        RTSP_BASE_URL,
+        MAX_STREAMS,
+    )
 
     store = DetectionStore()
-    store.clear()
-    threading.Thread(target=cleanup_loop, args=(store,), daemon=True, name="cleanup").start()
-
-    backoff = BACKOFF_MIN
-    while True:
-        try:
-            run_stream(detector, store)
-            log.warning("Stream ended")
-        except Exception as exc:
-            log.warning("Stream error: %s", exc)
-
-        # Drop stale boxes immediately so the UI does not show frozen overlays.
-        store.clear()
-        with status.lock:
-            status.reconnects += 1
-
-        log.info("Reconnecting in %.1fs", backoff)
-        time.sleep(backoff)
-        backoff = min(BACKOFF_MAX, backoff * 2)
-        # A successful connection resets the backoff inside run_stream's first
-        # frame; approximate that by resetting whenever we got frames recently.
-        with status.lock:
-            recent = status.last_frame_at and (time.time() - status.last_frame_at) < 60
-        if recent:
-            backoff = BACKOFF_MIN
+    supervise(detector, store)
 
 
 if __name__ == "__main__":

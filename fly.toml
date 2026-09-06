@@ -8,8 +8,11 @@
 #   fly deploy
 #
 # Required secrets:
-#   fly secrets set MEDIAMTX_RTSP_URL=... SUPABASE_URL=... \
-#     SUPABASE_SERVICE_ROLE_KEY=... FLIGHT_SESSION_ID=...
+#   fly secrets set SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... \
+#     DETECTOR_SHARED_SECRET=...
+#
+# No serial number or flight session is configured: the detector discovers
+# every active flight with a live Atlas stream by itself.
 
 app = "atlas-detector"
 primary_region = "ams"
@@ -31,43 +34,26 @@ primary_region = "ams"
     path = "/health"
 
 [env]
-  # "yolo" (fast COCO classes, 10fps) or "grounding_dino" (text-prompted, tuned config below).
-  DETECTION_ENGINE = "yolo"
+  # Stream discovery — no per-drone configuration needed.
+  RTSP_BASE_URL = "rtsp://live-video.internal:8554"
+  MAX_STREAMS = "2"
+  DISCOVERY_INTERVAL_SECONDS = "10"
+  SENSOR_STALE_SECONDS = "300"
+
+  # YOLOv8n detection.
   DETECTION_FPS = "10"
   DETECTION_CLASSES = "person,car,truck,bus,motorcycle,boat"
-  # Slightly lower than before: faster hits, at the cost of more false ones.
-  DETECTION_CONFIDENCE = "0.30"
-  # Longest side used for inference. Grounding DINO's processor rescales to
-  # shortest edge 800 anyway, so 480 only threw away detail.
-  INFER_MAX_SIDE = "800"
+  # Deliberately low: the video dialog filters client-side with a sensitivity
+  # slider, so the operator can raise sensitivity without a redeploy.
+  DETECTION_CONFIDENCE = "0.20"
+  # Longest side used for inference — the biggest latency win on CPU.
+  INFER_MAX_SIDE = "480"
   # Analysed frames a lost track survives inside ByteTrack.
   TRACKER_LOST_BUFFER = "5"
-  # Grounding DINO only — much slower on CPU.
-  DETECTION_FPS_GROUNDING_DINO = "0.8"
-  DETECTION_TEXT_PROMPT = "person . car . boat . truck . bus . motorcycle"
-  DETECTION_BOX_THRESHOLD = "0.25"
-  DETECTION_TEXT_THRESHOLD = "0.20"
-  # Tiled full-resolution scout (Grounding DINO only): finds small/distant
-  # objects the downscaled fast pass loses. Kept modest so it does not eat the
-  # whole CPU budget and starve the fast pass.
-  DETECTION_FPS_TILED = "0.3"
-  TILE_GRID = "2x3"
-  TILE_OVERLAP = "0.15"
-  TORCH_THREADS = "2"
-  ROI_PADDING = "0.2"
-  ROI_CONFIRM_FRAMES = "2"
-  ROI_MISS_LIMIT = "10"
-  ROI_MAX = "6"
-  ROI_IOU_MATCH = "0.6"
-
   # Boxes disappear fast when an object leaves the frame.
-  TRACK_TTL_SECONDS = "5.0"
-
-
+  TRACK_TTL_SECONDS = "0.8"
 
 [[vm]]
   # Dedicated CPU — on shared CPU the machine, not the code, caps the frame rate.
-  size = "performance-8x"
-  # 4 GB: torch + the Swin-T backbone does not fit in 2 GB when
-  # DETECTION_ENGINE=grounding_dino.
-  memory = "16384mb"
+  size = "performance-2x"
+  memory = "4096mb"
