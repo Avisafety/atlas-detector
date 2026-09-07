@@ -129,6 +129,49 @@ RANGE_RESULT_MAX_AGE_SECONDS = float(
 # Temporary diagnostics: log per-source counts and every suppressed duplicate.
 RANGE_DEBUG = os.environ.get("RANGE_DEBUG", "false").lower() == "true"
 
+# --- Motion pass (third detection source) ---------------------------------- #
+# YOLO can only report an object it recognises. A distant object is often just
+# a few pixels of "something that moves differently than the ground" long
+# before its shape is classifiable. This pass finds those, labels them
+# `unknown`, and feeds them into the SAME tracker — so the track keeps its id
+# when YOLO later manages to classify it.
+UNKNOWN_CLASS = "unknown"
+MOTION_PASS_ENABLED = os.environ.get("MOTION_PASS_ENABLED", "true").lower() != "false"
+# Analyses per second. Low on purpose: this runs beside the fast + range pass.
+MOTION_FPS = float(os.environ.get("MOTION_FPS", "3") or 3)
+# Frames are compared at this longest side — enough for motion, cheap on CPU.
+MOTION_MAX_SIDE = int(os.environ.get("MOTION_MAX_SIDE", "960") or 960)
+# Pixel difference (0-255) that counts as movement after camera compensation.
+MOTION_DIFF_THRESHOLD = int(os.environ.get("MOTION_DIFF_THRESHOLD", "18") or 18)
+# Area bounds on the analysis frame: kills sensor noise and "the whole picture
+# moved" (failed compensation).
+MOTION_MIN_AREA_PX = int(os.environ.get("MOTION_MIN_AREA_PX", "12") or 12)
+MOTION_MAX_AREA_FRAC = float(os.environ.get("MOTION_MAX_AREA_FRAC", "0.08") or 0.08)
+# A candidate must reappear in roughly the same place this many analyses in a
+# row before it is published — removes parallax flicker and single-frame blobs.
+MOTION_CONFIRM_HITS = int(os.environ.get("MOTION_CONFIRM_HITS", "3") or 3)
+# How close two candidates must be (centre distance / box size) to count as the
+# same candidate between analyses.
+MOTION_MATCH_DISTANCE = float(os.environ.get("MOTION_MATCH_DISTANCE", "2.0") or 2.0)
+# Minimum inliers for the camera-motion estimate; below this the frame is
+# skipped rather than published as noise.
+MOTION_MIN_INLIERS = int(os.environ.get("MOTION_MIN_INLIERS", "12") or 12)
+# Fixed confidence written for unknown candidates.
+MOTION_CONFIDENCE = float(os.environ.get("MOTION_CONFIDENCE", "0.10") or 0.10)
+# Candidates are re-fed between analyses only while fresh.
+MOTION_RESULT_MAX_AGE_SECONDS = float(
+    os.environ.get("MOTION_RESULT_MAX_AGE_SECONDS", "0") or 0
+) or (1.0 / MOTION_FPS + 0.5 if MOTION_FPS > 0 else 1.0)
+
+# --- Locked track ----------------------------------------------------------- #
+# A user can lock one object in the UI. A locked track gets a padded ROI
+# analysed at native resolution on every fast round (lower threshold) and a
+# longer TTL, so it survives shake and short occlusions better than the rest.
+LOCK_POLL_SECONDS = float(os.environ.get("LOCK_POLL_SECONDS", "2.0") or 2.0)
+LOCK_ROI_PADDING = float(os.environ.get("LOCK_ROI_PADDING", "0.6") or 0.6)
+LOCK_ROI_CONFIDENCE = float(os.environ.get("LOCK_ROI_CONFIDENCE", "0.08") or 0.08)
+LOCK_TTL_SECONDS = float(os.environ.get("LOCK_TTL_SECONDS", "5.0") or 5.0)
+
 MODEL_PATH = os.environ.get("MODEL_PATH", "yolo26n.pt")
 
 # Backoff bounds for reconnecting to MediaMTX.
@@ -299,15 +342,38 @@ class DetectionStore:
     def prune(self, session_ids: list[str]) -> None:
         if not session_ids:
             return
-        cutoff = (
-            datetime.now(timezone.utc) - timedelta(seconds=TRACK_TTL_SECONDS)
-        ).isoformat()
+        now = datetime.now(timezone.utc)
+        cutoff = (now - timedelta(seconds=TRACK_TTL_SECONDS)).isoformat()
+        locked_cutoff = (now - timedelta(seconds=LOCK_TTL_SECONDS)).isoformat()
         try:
+            # Unlocked tracks disappear fast so the overlay never lags reality.
             self.client.table("atlas_detections").delete().in_(
                 "flight_session_id", session_ids
-            ).lt("updated_at", cutoff).execute()
+            ).lt("updated_at", cutoff).eq("is_locked", False).execute()
+            # A locked track is what the user is watching — it gets a longer
+            # grace period so a moment of occlusion does not drop the box.
+            self.client.table("atlas_detections").delete().in_(
+                "flight_session_id", session_ids
+            ).lt("updated_at", locked_cutoff).eq("is_locked", True).execute()
         except Exception as exc:
             log.warning("Prune failed: %s", exc)
+
+    def locked_tracks(self, session_id: str) -> set[int]:
+        """track_ids the user has locked in the UI for this flight session."""
+        try:
+            rows = (
+                self.client.table("atlas_detections")
+                .select("track_id")
+                .eq("flight_session_id", session_id)
+                .eq("is_locked", True)
+                .execute()
+                .data
+                or []
+            )
+            return {int(r["track_id"]) for r in rows}
+        except Exception as exc:
+            log.warning("Locked-track lookup failed: %s", exc)
+            return set()
 
     def clear(self, session_id: str) -> None:
         try:
@@ -464,8 +530,17 @@ def attach_labels(detections, labels: list[str]):
     return detections
 
 
-def build_rows(detections, session_id: str, width: int, height: int) -> list[dict]:
-    """Turn tracked detections into atlas_detections rows (normalised boxes)."""
+def build_rows(
+    detections,
+    session_id: str,
+    width: int,
+    height: int,
+) -> list[dict]:
+    """Turn tracked detections into atlas_detections rows (normalised boxes).
+
+    `is_locked` is deliberately NOT written here: it is owned by the UI, and
+    the upsert only touches the keys present in the payload.
+    """
     tracked_labels = detections.data.get("label") if detections.data else None
     timestamp = datetime.now(timezone.utc).isoformat()
     confidences = (
@@ -490,8 +565,10 @@ def build_rows(detections, session_id: str, width: int, height: int) -> list[dic
             if tracked_labels is not None and idx < len(tracked_labels)
             else ""
         )
+        # A track can exist before any pass could classify it (motion source).
+        # It is published as `unknown` and upgraded in place later.
         if not name:
-            continue
+            name = UNKNOWN_CLASS
         x1, y1, x2, y2 = (float(v) for v in xyxy)
         # Normalise to 0–1 and clamp so partially off-screen boxes stay valid.
         nx = max(0.0, min(1.0, x1 / width))
@@ -584,6 +661,25 @@ def is_duplicate(box_a: np.ndarray, box_b: np.ndarray) -> bool:
     return containment_matrix(a, b)[0, 0] > RANGE_CONTAINMENT
 
 
+def merge_source(detections, labels, extra, extra_labels, scale: float):
+    """Append another source's boxes (full-res coords) to the fast-pass set."""
+    if extra is None or len(extra) == 0:
+        return detections, labels
+    extra_conf = (
+        extra.confidence if extra.confidence is not None else np.zeros(len(extra))
+    )
+    base_conf = (
+        detections.confidence
+        if detections.confidence is not None
+        else np.zeros(len(detections))
+    )
+    merged = sv.Detections(
+        xyxy=np.concatenate([detections.xyxy, extra.xyxy * scale]),
+        confidence=np.concatenate([base_conf, extra_conf]),
+    )
+    return merged, list(labels) + list(extra_labels)
+
+
 def dedupe_class_aware(detections, labels: list[str], iou_thr: float | None = None):
     """Keep the highest-confidence box per physical object, per class.
 
@@ -598,13 +694,23 @@ def dedupe_class_aware(detections, labels: list[str], iou_thr: float | None = No
         if detections.confidence is not None
         else np.zeros(len(detections))
     )
-    order = np.argsort(-confidence)
+    # Classified boxes are considered first, then by confidence: an `unknown`
+    # motion candidate must always lose against a real class on the same
+    # object, never the other way around.
+    unknown = np.array([1 if l == UNKNOWN_CLASS else 0 for l in labels])
+    order = np.lexsort((-np.asarray(confidence, dtype=float), unknown))
     keep: list[int] = []
     boxes = detections.xyxy
     for idx in order:
         duplicate = False
         for kept in keep:
-            if labels[kept] != labels[idx]:
+            # Same class = same object candidate. `unknown` is compared against
+            # every class, so a motion box on an object YOLO also found is
+            # suppressed instead of becoming a second box.
+            if (
+                labels[kept] != labels[idx]
+                and UNKNOWN_CLASS not in (labels[kept], labels[idx])
+            ):
                 continue
             if is_duplicate(boxes[idx], boxes[kept]):
                 duplicate = True
@@ -625,6 +731,206 @@ def dedupe_class_aware(detections, labels: list[str], iou_thr: float | None = No
     if len(keep) == len(detections):
         return detections, labels
     return detections[keep], [labels[i] for i in keep]
+
+
+class MotionScanner:
+    """Third detection source: objects that MOVE, before they are classifiable.
+
+    YOLO needs to recognise a shape. Something far away is often just a handful
+    of pixels moving against the background long before its shape says "boat"
+    or "person". This scanner finds those pixels and hands the tracker an
+    `unknown` box, which is upgraded to a real class in place the moment the
+    fast or range pass can name it.
+
+    The camera itself moves (the drone flies and pans), so a naive frame diff
+    lights up the whole picture. Global motion is estimated with ORB features +
+    a partial affine fit (RANSAC); the previous frame is warped into the
+    current one before differencing, leaving only motion that disagrees with
+    the camera.
+
+    False positives are handled with: area bounds (noise / failed
+    compensation), a short accumulator so slow movers still build up signal,
+    and a confirmation requirement — a candidate must reappear in roughly the
+    same place N analyses in a row (kills parallax flicker from terrain edges).
+    """
+
+    def __init__(self, path: str, frame_source) -> None:
+        self._path = path
+        self._frame_source = frame_source
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._detections: sv.Detections | None = None
+        self._updated_at: float = 0.0
+        # Confirmation state: list of [cx, cy, w, h, hits] in analysis coords.
+        self._candidates: list[list[float]] = []
+        self._prev_gray = None
+        self._accum = None
+        self._interval = 1.0 / MOTION_FPS if MOTION_FPS > 0 else 0.33
+        self._orb = cv2.ORB_create(nfeatures=600)
+        self._matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name=f"motion-{path}"
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def latest(self) -> tuple[sv.Detections | None, float]:
+        with self._lock:
+            return self._detections, self._updated_at
+
+    # -- internals ---------------------------------------------------------- #
+
+    def _run(self) -> None:
+        log.info("[%s] motion pass: %.1f analyses/s", self._path, MOTION_FPS)
+        while not self._stop.is_set():
+            frame = self._frame_source()
+            if frame is None:
+                if self._stop.wait(0.2):
+                    break
+                continue
+            started = time.time()
+            try:
+                self._scan(frame)
+            except Exception as exc:
+                log.warning("[%s] motion pass error: %s", self._path, exc)
+            remaining = self._interval - (time.time() - started)
+            if self._stop.wait(max(0.05, remaining)):
+                break
+        log.info("[%s] motion pass stopped", self._path)
+
+    def _align(self, prev_gray, gray):
+        """Warp `prev_gray` into `gray` using estimated camera motion.
+
+        Returns None when the estimate is not trustworthy (too few matches,
+        heavy blur) — skipping a frame beats publishing a screen full of noise.
+        """
+        kp1, des1 = self._orb.detectAndCompute(prev_gray, None)
+        kp2, des2 = self._orb.detectAndCompute(gray, None)
+        if des1 is None or des2 is None or len(kp1) < 8 or len(kp2) < 8:
+            return None
+        matches = self._matcher.match(des1, des2)
+        if len(matches) < MOTION_MIN_INLIERS:
+            return None
+        matches = sorted(matches, key=lambda m: m.distance)[:200]
+        src = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+        dst = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+        matrix, inliers = cv2.estimateAffinePartial2D(
+            src, dst, method=cv2.RANSAC, ransacReprojThreshold=3.0
+        )
+        if matrix is None or inliers is None or int(inliers.sum()) < MOTION_MIN_INLIERS:
+            return None
+        h, w = gray.shape[:2]
+        return cv2.warpAffine(prev_gray, matrix, (w, h), flags=cv2.INTER_LINEAR)
+
+    def _scan(self, frame) -> None:
+        full_h, full_w = frame.shape[:2]
+        scale = 1.0
+        if MOTION_MAX_SIDE and max(full_w, full_h) > MOTION_MAX_SIDE:
+            scale = MOTION_MAX_SIDE / float(max(full_w, full_h))
+        small = (
+            cv2.resize(
+                frame,
+                (max(1, int(full_w * scale)), max(1, int(full_h * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+            if scale != 1.0
+            else frame
+        )
+        gray = cv2.GaussianBlur(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+
+        prev = self._prev_gray
+        self._prev_gray = gray
+        if prev is None or prev.shape != gray.shape:
+            self._accum = None
+            return
+
+        aligned = self._align(prev, gray)
+        if aligned is None:
+            return
+
+        diff = cv2.absdiff(aligned, gray).astype(np.float32)
+        # Short accumulator: a slow object moves few pixels per analysis, so a
+        # single difference is weak. Decaying sum keeps that signal alive.
+        if self._accum is None or self._accum.shape != diff.shape:
+            self._accum = diff
+        else:
+            self._accum = self._accum * 0.5 + diff
+        mask = (self._accum > MOTION_DIFF_THRESHOLD).astype(np.uint8) * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(
+            mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        )
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        h, w = gray.shape[:2]
+        frame_area = float(h * w)
+        raw: list[tuple[float, float, float, float]] = []
+        for contour in contours:
+            x, y, bw, bh = cv2.boundingRect(contour)
+            area = float(bw * bh)
+            if area < MOTION_MIN_AREA_PX:
+                continue
+            if area > frame_area * MOTION_MAX_AREA_FRAC:
+                continue
+            # Warp artefacts hug the frame border and are extremely elongated.
+            aspect = max(bw, bh) / max(1.0, min(bw, bh))
+            touches_border = x <= 1 or y <= 1 or x + bw >= w - 1 or y + bh >= h - 1
+            if touches_border and aspect > 4.0:
+                continue
+            raw.append((float(x), float(y), float(bw), float(bh)))
+
+        confirmed = self._confirm(raw)
+
+        if confirmed:
+            boxes = np.array(
+                [
+                    [x / scale, y / scale, (x + bw) / scale, (y + bh) / scale]
+                    for x, y, bw, bh in confirmed
+                ],
+                dtype=np.float32,
+            )
+            detections = sv.Detections(
+                xyxy=boxes,
+                confidence=np.full(len(boxes), MOTION_CONFIDENCE, dtype=np.float32),
+            )
+        else:
+            detections = sv.Detections.empty()
+
+        with self._lock:
+            self._detections = detections
+            self._updated_at = time.time()
+        if RANGE_DEBUG:
+            log.info(
+                "[%s] motion: %d blob(s) -> %d confirmed",
+                self._path,
+                len(raw),
+                len(confirmed),
+            )
+
+    def _confirm(self, raw) -> list[tuple[float, float, float, float]]:
+        """Only publish candidates seen in the same place several times."""
+        next_state: list[list[float]] = []
+        confirmed: list[tuple[float, float, float, float]] = []
+        used: set[int] = set()
+        for x, y, bw, bh in raw:
+            cx, cy = x + bw / 2.0, y + bh / 2.0
+            reach = MOTION_MATCH_DISTANCE * max(bw, bh)
+            hits = 1
+            for i, prev in enumerate(self._candidates):
+                if i in used:
+                    continue
+                if abs(prev[0] - cx) <= reach and abs(prev[1] - cy) <= reach:
+                    hits = int(prev[4]) + 1
+                    used.add(i)
+                    break
+            next_state.append([cx, cy, bw, bh, hits])
+            if hits >= MOTION_CONFIRM_HITS:
+                confirmed.append((x, y, bw, bh))
+        self._candidates = next_state
+        return confirmed
 
 
 class RangeScanner:
@@ -817,13 +1123,19 @@ class StreamWorker(threading.Thread):
         tracker = sv.ByteTrack(
             lost_track_buffer=TRACKER_LOST_BUFFER,
             frame_rate=max(1, int(round(DETECTION_FPS))),
-            track_activation_threshold=min(0.25, DETECTION_CONFIDENCE),
+            # Motion candidates carry a deliberately low, fixed confidence —
+            # the tracker must still be allowed to open a track for them.
+            track_activation_threshold=min(
+                0.25,
+                DETECTION_CONFIDENCE,
+                MOTION_CONFIDENCE if MOTION_PASS_ENABLED else 1.0,
+            ),
         )
         grabber = FrameGrabber(cap)
         last_seq = 0
         last_inference = 0.0
 
-        # Latest full-resolution frame, shared with the long-range scanner.
+        # Latest full-resolution frame, shared with the background scanners.
         full_frame_slot: dict = {"frame": None, "seq": -1}
 
         def latest_full_frame():
@@ -834,6 +1146,17 @@ class StreamWorker(threading.Thread):
             if RANGE_PASS_ENABLED
             else None
         )
+        motion = (
+            MotionScanner(self.path, latest_full_frame)
+            if MOTION_PASS_ENABLED
+            else None
+        )
+
+        # Locked track: polled from Supabase (the UI owns the flag) plus the
+        # last known normalised box per track, used to build the priority ROI.
+        locked_ids: set[int] = set()
+        last_locked_poll = 0.0
+        last_boxes: dict[int, tuple[float, float, float, float]] = {}
 
         try:
             while not self._stop.is_set():
@@ -906,14 +1229,50 @@ class StreamWorker(threading.Thread):
                         )
                         labels = labels + list(range_labels)
 
+                # Motion candidates: objects that move against the compensated
+                # background but are not classifiable yet. Same coordinate
+                # conversion, same dedupe, same tracker — a motion box that
+                # lands on an object YOLO already found is suppressed, so one
+                # object never gets two boxes.
+                motion_count = 0
+                if motion is not None:
+                    motion_dets, motion_at = motion.latest()
+                    fresh = (now - motion_at) <= MOTION_RESULT_MAX_AGE_SECONDS
+                    if motion_dets is not None and len(motion_dets) > 0 and fresh:
+                        motion_count = len(motion_dets)
+                        detections, labels = merge_source(
+                            detections,
+                            labels,
+                            motion_dets,
+                            [UNKNOWN_CLASS] * motion_count,
+                            scale,
+                        )
+
+                # Locked track priority: analyse a padded crop around the last
+                # known box at native resolution and with a lower threshold, so
+                # the object the user is watching keeps being found through
+                # shake and partial occlusion.
+                lock_count = 0
+                if locked_ids and full_frame_slot["frame"] is not None:
+                    lock_dets, lock_labels = self._detect_locked_rois(
+                        full_frame_slot["frame"], locked_ids, last_boxes
+                    )
+                    if lock_dets is not None and len(lock_dets) > 0:
+                        lock_count = len(lock_dets)
+                        detections, labels = merge_source(
+                            detections, labels, lock_dets, lock_labels, scale
+                        )
+
                 merged_count = len(detections)
                 detections, labels = dedupe_class_aware(detections, labels)
                 if RANGE_DEBUG:
                     log.info(
-                        "[%s] sources: fast=%d range=%d merged=%d after-dedupe=%d",
+                        "[%s] sources: fast=%d range=%d motion=%d lock=%d merged=%d after-dedupe=%d",
                         self.path,
                         raw_count,
                         range_count,
+                        motion_count,
+                        lock_count,
                         merged_count,
                         len(detections),
                     )
@@ -922,6 +1281,17 @@ class StreamWorker(threading.Thread):
                     attach_labels(detections, labels)
                 )
                 rows = build_rows(detections, self.session_id, width, height)
+
+                # Remember where each track was (normalised) for the lock ROI.
+                last_boxes = {
+                    int(r["track_id"]): (
+                        r["bbox"]["x"],
+                        r["bbox"]["y"],
+                        r["bbox"]["width"],
+                        r["bbox"]["height"],
+                    )
+                    for r in rows
+                }
 
                 log.info(
                     "[%s] %d raw -> %d tracked -> %d row(s) in %.0f ms",
@@ -934,12 +1304,76 @@ class StreamWorker(threading.Thread):
 
                 status.update(self.session_id, active_tracks=len(rows))
                 self.store.upsert(rows)
+
+                # The lock flag is written by the UI — poll it at a low rate.
+                if now - last_locked_poll >= LOCK_POLL_SECONDS:
+                    last_locked_poll = now
+                    new_locked = self.store.locked_tracks(self.session_id)
+                    if new_locked != locked_ids:
+                        log.info("[%s] locked tracks: %s", self.path, sorted(new_locked))
+                    locked_ids = new_locked
         finally:
             if scanner is not None:
                 scanner.stop()
+            if motion is not None:
+                motion.stop()
             grabber.stop()
             cap.release()
             status.update(self.session_id, connected=False, active_tracks=0)
+
+    def _detect_locked_rois(
+        self,
+        full_frame,
+        locked_ids: set[int],
+        last_boxes: dict[int, tuple[float, float, float, float]],
+    ):
+        """Native-resolution detection inside a padded crop per locked track."""
+        height, width = full_frame.shape[:2]
+        boxes: list[np.ndarray] = []
+        confs: list[float] = []
+        labels: list[str] = []
+        for track_id in locked_ids:
+            box = last_boxes.get(track_id)
+            if not box:
+                continue
+            nx, ny, nw, nh = box
+            pad_w = nw * LOCK_ROI_PADDING
+            pad_h = nh * LOCK_ROI_PADDING
+            x0 = int(max(0, (nx - pad_w) * width))
+            y0 = int(max(0, (ny - pad_h) * height))
+            x1 = int(min(width, (nx + nw + pad_w) * width))
+            y1 = int(min(height, (ny + nh + pad_h) * height))
+            if x1 - x0 < 8 or y1 - y0 < 8:
+                continue
+            crop = full_frame[y0:y1, x0:x1]
+            try:
+                dets, det_labels = self.detector.detect(crop, conf=LOCK_ROI_CONFIDENCE)
+            except Exception as exc:
+                log.warning("[%s] lock ROI failed: %s", self.path, exc)
+                continue
+            if len(dets) == 0:
+                continue
+            xyxy = dets.xyxy.copy()
+            xyxy[:, 0] += x0
+            xyxy[:, 2] += x0
+            xyxy[:, 1] += y0
+            xyxy[:, 3] += y0
+            confidence = (
+                dets.confidence
+                if dets.confidence is not None
+                else np.zeros(len(dets))
+            )
+            boxes.append(xyxy)
+            confs.append(confidence)
+            labels.extend(det_labels)
+        if not boxes:
+            return None, []
+        return (
+            sv.Detections(
+                xyxy=np.concatenate(boxes), confidence=np.concatenate(confs)
+            ),
+            labels,
+        )
 
 
 # --------------------------------------------------------------------------- #
