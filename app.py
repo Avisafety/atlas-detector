@@ -365,18 +365,43 @@ class DetectionStore:
 
     def __init__(self) -> None:
         self.client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+        # Writes happen on a background thread: a network round-trip inside the
+        # detection loop costs 50-200 ms per frame, which shows up directly as
+        # boxes lagging behind the video. Only the newest rows per session are
+        # kept, so a slow write is skipped instead of queued.
+        self._pending: dict[str, list[dict]] = {}
+        self._pending_lock = threading.Lock()
+        self._pending_event = threading.Event()
+        threading.Thread(target=self._writer_loop, daemon=True).start()
 
     # -- detections --------------------------------------------------------- #
 
     def upsert(self, rows: list[dict]) -> None:
         if not rows:
             return
+        key = str(rows[0].get("flight_session_id") or "")
+        with self._pending_lock:
+            self._pending[key] = rows
+        self._pending_event.set()
+
+    def _writer_loop(self) -> None:
+        while True:
+            self._pending_event.wait(0.1)
+            self._pending_event.clear()
+            with self._pending_lock:
+                batches = list(self._pending.values())
+                self._pending.clear()
+            for rows in batches:
+                self._write(rows)
+
+    def _write(self, rows: list[dict]) -> None:
         try:
             self.client.table("atlas_detections").upsert(
                 rows, on_conflict="flight_session_id,track_id"
             ).execute()
         except Exception as exc:  # never let a write error kill the loop
             log.warning("Upsert failed: %s", exc)
+
 
     def prune(self, session_ids: list[str]) -> None:
         if not session_ids:
