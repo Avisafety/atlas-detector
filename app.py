@@ -34,6 +34,19 @@ CPU only. Everything is configured through environment variables:
   RANGE_TILE_OVERLAP
   RANGE_CONFIDENCE              separate threshold for the range pass, 0.15
   RANGE_DEDUPE_IOU              overlap at which duplicate boxes are merged, 0.5
+  MOTION_PASS_ENABLED           motion-based pass for unclassifiable objects
+  MOTION_FPS                    analyses per second, default 3
+  MOTION_MAX_SIDE               analysis resolution, default 960
+  MOTION_DIFF_THRESHOLD         pixel diff counted as movement, default 18
+  MOTION_MIN_AREA_PX            smallest blob accepted, default 12
+  MOTION_MAX_AREA_FRAC          largest blob as fraction of frame, default 0.08
+  MOTION_CONFIRM_HITS           analyses in a row before publishing, default 3
+  MOTION_MIN_INLIERS            RANSAC inliers required, default 12
+  MOTION_CONFIDENCE             fixed confidence for unknown boxes, default 0.10
+  LOCK_POLL_SECONDS             how often the UI lock flag is read, default 2.0
+  LOCK_ROI_PADDING              padding around the locked box, default 0.6
+  LOCK_ROI_CONFIDENCE           threshold inside the locked ROI, default 0.08
+  LOCK_TTL_SECONDS              grace period for a locked track, default 5.0
 """
 
 from __future__ import annotations
@@ -87,8 +100,10 @@ DETECTION_CONFIDENCE = float(os.environ.get("DETECTION_CONFIDENCE", "0.20") or 0
 TRACK_TTL_SECONDS = float(os.environ.get("TRACK_TTL_SECONDS", "0.8") or 0.8)
 # Downscale before inference: the single biggest latency win on CPU. 0 = off.
 INFER_MAX_SIDE = int(os.environ.get("INFER_MAX_SIDE", "640") or 640)
-# How many analysed frames a lost track survives inside the tracker.
-TRACKER_LOST_BUFFER = int(os.environ.get("TRACKER_LOST_BUFFER", "5") or 5)
+# How many analysed frames a lost track survives inside the tracker. Kept
+# generous: when the camera pans, a track can miss a couple of rounds before
+# the boxes line up again — a short buffer turns that into a brand new id.
+TRACKER_LOST_BUFFER = int(os.environ.get("TRACKER_LOST_BUFFER", "15") or 15)
 DEFAULT_CLASSES = (
     "person,bicycle,car,motorcycle,airplane,bus,train,truck,boat,"
     "bird,dog,horse,sheep,cow,kite,surfboard"
@@ -145,14 +160,16 @@ MOTION_MAX_SIDE = int(os.environ.get("MOTION_MAX_SIDE", "960") or 960)
 MOTION_DIFF_THRESHOLD = int(os.environ.get("MOTION_DIFF_THRESHOLD", "18") or 18)
 # Area bounds on the analysis frame: kills sensor noise and "the whole picture
 # moved" (failed compensation).
-MOTION_MIN_AREA_PX = int(os.environ.get("MOTION_MIN_AREA_PX", "12") or 12)
-MOTION_MAX_AREA_FRAC = float(os.environ.get("MOTION_MAX_AREA_FRAC", "0.08") or 0.08)
+MOTION_MIN_AREA_PX = int(os.environ.get("MOTION_MIN_AREA_PX", "8") or 8)
+MOTION_MAX_AREA_FRAC = float(os.environ.get("MOTION_MAX_AREA_FRAC", "0.12") or 0.12)
 # A candidate must reappear in roughly the same place this many analyses in a
 # row before it is published — removes parallax flicker and single-frame blobs.
-MOTION_CONFIRM_HITS = int(os.environ.get("MOTION_CONFIRM_HITS", "3") or 3)
+# Two is enough at 3 analyses/second: three meant slow movers (leaves, a distant
+# boat) were dropped before they ever reached the tracker.
+MOTION_CONFIRM_HITS = int(os.environ.get("MOTION_CONFIRM_HITS", "2") or 2)
 # How close two candidates must be (centre distance / box size) to count as the
 # same candidate between analyses.
-MOTION_MATCH_DISTANCE = float(os.environ.get("MOTION_MATCH_DISTANCE", "2.0") or 2.0)
+MOTION_MATCH_DISTANCE = float(os.environ.get("MOTION_MATCH_DISTANCE", "3.0") or 3.0)
 # Minimum inliers for the camera-motion estimate; below this the frame is
 # skipped rather than published as noise.
 MOTION_MIN_INLIERS = int(os.environ.get("MOTION_MIN_INLIERS", "12") or 12)
@@ -164,13 +181,35 @@ MOTION_RESULT_MAX_AGE_SECONDS = float(
 ) or (1.0 / MOTION_FPS + 0.5 if MOTION_FPS > 0 else 1.0)
 
 # --- Locked track ----------------------------------------------------------- #
-# A user can lock one object in the UI. A locked track gets a padded ROI
-# analysed at native resolution on every fast round (lower threshold) and a
-# longer TTL, so it survives shake and short occlusions better than the rest.
+# A locked object is followed by a PIXEL tracker (CSRT) instead of by the
+# detector: it keeps its box and its id while the camera moves, even when YOLO
+# loses the object for a moment, and it is published outside ByteTrack so the
+# lock can never turn into two competing boxes.
 LOCK_POLL_SECONDS = float(os.environ.get("LOCK_POLL_SECONDS", "2.0") or 2.0)
-LOCK_ROI_PADDING = float(os.environ.get("LOCK_ROI_PADDING", "0.6") or 0.6)
-LOCK_ROI_CONFIDENCE = float(os.environ.get("LOCK_ROI_CONFIDENCE", "0.08") or 0.08)
 LOCK_TTL_SECONDS = float(os.environ.get("LOCK_TTL_SECONDS", "5.0") or 5.0)
+# Overlap at which a detection is accepted as "this is the locked object" and
+# used to re-centre the pixel tracker and name the class.
+LOCK_MATCH_IOU = float(os.environ.get("LOCK_MATCH_IOU", "0.3") or 0.3)
+# How long the lock survives with neither pixel tracking nor a detection before
+# it is released and the UI clears it.
+LOCK_GRACE_SECONDS = float(os.environ.get("LOCK_GRACE_SECONDS", "4.0") or 4.0)
+
+# Classes YOLO regularly swaps between on the same object. Treated as one class
+# during duplicate suppression, so a car does not also get a truck box.
+CONFUSABLE_CLASS_GROUPS = (
+    {"car", "truck", "bus", "train", "boat"},
+    {"person", "bicycle", "motorcycle"},
+    {"bird", "airplane", "kite"},
+    {"dog", "sheep", "cow", "horse"},
+)
+
+
+def class_group(label: str) -> str:
+    """Group name used for duplicate suppression (see CONFUSABLE_CLASS_GROUPS)."""
+    for group in CONFUSABLE_CLASS_GROUPS:
+        if label in group:
+            return next(iter(sorted(group)))
+    return label
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "yolo26n.pt")
 
@@ -358,22 +397,43 @@ class DetectionStore:
         except Exception as exc:
             log.warning("Prune failed: %s", exc)
 
-    def locked_tracks(self, session_id: str) -> set[int]:
-        """track_ids the user has locked in the UI for this flight session."""
+    def locked_tracks(self, session_id: str) -> dict[int, dict]:
+        """Locks the user made in the UI: track_id -> row (bbox, class, conf).
+
+        A negative track_id is a manual lock: the user clicked somewhere in the
+        picture where nothing was detected, and the UI wrote the click box
+        itself. Both kinds are handled identically from here on.
+        """
         try:
             rows = (
                 self.client.table("atlas_detections")
-                .select("track_id")
+                .select("track_id,bbox,object_class,confidence")
                 .eq("flight_session_id", session_id)
                 .eq("is_locked", True)
                 .execute()
                 .data
                 or []
             )
-            return {int(r["track_id"]) for r in rows}
+            return {int(r["track_id"]): r for r in rows}
         except Exception as exc:
             log.warning("Locked-track lookup failed: %s", exc)
-            return set()
+            return {}
+
+    def clear_lock(self, session_id: str, track_id: int) -> None:
+        """Release a lock the detector can no longer follow."""
+        try:
+            table = self.client.table("atlas_detections")
+            if track_id < 0:
+                # Manual click lock: nothing else owns the row, so drop it.
+                table.delete().eq("flight_session_id", session_id).eq(
+                    "track_id", track_id
+                ).execute()
+            else:
+                table.update({"is_locked": False}).eq(
+                    "flight_session_id", session_id
+                ).eq("track_id", track_id).execute()
+        except Exception as exc:
+            log.warning("Lock release failed: %s", exc)
 
     def clear(self, session_id: str) -> None:
         try:
@@ -704,11 +764,13 @@ def dedupe_class_aware(detections, labels: list[str], iou_thr: float | None = No
     for idx in order:
         duplicate = False
         for kept in keep:
-            # Same class = same object candidate. `unknown` is compared against
-            # every class, so a motion box on an object YOLO also found is
-            # suppressed instead of becoming a second box.
+            # Same class group = same object candidate. `unknown` is compared
+            # against every class, so a motion box on an object YOLO also found
+            # is suppressed instead of becoming a second box. Confusable classes
+            # (car/truck, person/bicycle, ...) share a group, so the same object
+            # cannot keep one box per guess.
             if (
-                labels[kept] != labels[idx]
+                class_group(labels[kept]) != class_group(labels[idx])
                 and UNKNOWN_CLASS not in (labels[kept], labels[idx])
             ):
                 continue
@@ -1063,6 +1125,132 @@ class RangeScanner:
 
 
 # --------------------------------------------------------------------------- #
+# Locked objects (pixel tracking)
+# --------------------------------------------------------------------------- #
+
+
+def _create_cv_tracker():
+    """Best available OpenCV pixel tracker (CSRT preferred, KCF as fallback)."""
+    factories = (
+        getattr(cv2, "TrackerCSRT_create", None),
+        getattr(getattr(cv2, "legacy", None), "TrackerCSRT_create", None),
+        getattr(cv2, "TrackerKCF_create", None),
+        getattr(getattr(cv2, "legacy", None), "TrackerKCF_create", None),
+        # Last resort: always present, less accurate, but keeps a lock alive.
+        getattr(cv2, "TrackerMIL_create", None),
+    )
+    for factory in factories:
+        if factory is None:
+            continue
+        try:
+            return factory()
+        except Exception:  # pragma: no cover - build without contrib modules
+            continue
+    return None
+
+
+class LockTracker:
+    """Follows ONE locked object by its pixels, independent of the detector.
+
+    The detector loses and re-finds objects constantly, and every re-find risks
+    a new track id — which is exactly how a lock used to jump off the object
+    when the camera moved. A locked object is therefore followed by an OpenCV
+    pixel tracker and published on its own, outside ByteTrack: one lock, one
+    box, one id, for as long as the user keeps it.
+
+    Whenever the detector produces a box that clearly overlaps the lock, that
+    box wins: it re-centres the pixel tracker (removing drift) and names the
+    class, so a manual click on "some pixels" becomes "person 84%" by itself.
+    """
+
+    def __init__(self, track_id: int, frame, box, label: str, confidence: float):
+        self.track_id = int(track_id)
+        self.label = (label or UNKNOWN_CLASS).strip().lower() or UNKNOWN_CLASS
+        self.confidence = float(confidence or 0.0)
+        self.box = np.asarray(box, dtype=float)
+        self.last_seen = time.time()
+        self.impl = None
+        self._init_impl(frame)
+
+    def _rect(self, frame) -> tuple[int, int, int, int]:
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = (float(v) for v in self.box)
+        x1 = max(0.0, min(w - 2.0, x1))
+        y1 = max(0.0, min(h - 2.0, y1))
+        x2 = max(x1 + 2.0, min(float(w), x2))
+        y2 = max(y1 + 2.0, min(float(h), y2))
+        # Integers: some OpenCV builds reject float bounding boxes in init().
+        return (int(x1), int(y1), int(max(2.0, x2 - x1)), int(max(2.0, y2 - y1)))
+
+    def _init_impl(self, frame) -> None:
+        impl = _create_cv_tracker()
+        if impl is None:
+            return
+        try:
+            impl.init(frame, self._rect(frame))
+            self.impl = impl
+        except Exception as exc:
+            log.warning("Lock %s: pixel tracker init failed: %s", self.track_id, exc)
+            self.impl = None
+
+    def update(self, frame) -> bool:
+        """Advance the box one frame. False = the pixels were lost."""
+        if self.impl is None:
+            return False
+        try:
+            ok, rect = self.impl.update(frame)
+        except Exception:
+            return False
+        if not ok:
+            return False
+        x, y, w, h = (float(v) for v in rect)
+        if w < 2 or h < 2:
+            return False
+        self.box = np.array([x, y, x + w, y + h], dtype=float)
+        self.last_seen = time.time()
+        return True
+
+    def correct(self, frame, box, label: str, confidence: float) -> None:
+        """Snap to a detector box and restart pixel tracking from there."""
+        self.box = np.asarray(box, dtype=float)
+        self.last_seen = time.time()
+        if label:
+            self.label = label
+        self.confidence = float(confidence or 0.0)
+        self._init_impl(frame)
+
+
+def lock_row(
+    session_id: str,
+    track_id: int,
+    box,
+    width: int,
+    height: int,
+    label: str,
+    confidence: float,
+) -> dict:
+    """Row for a locked object (same shape as build_rows, exactly one box)."""
+    x1, y1, x2, y2 = (float(v) for v in box)
+    nx = max(0.0, min(1.0, x1 / width))
+    ny = max(0.0, min(1.0, y1 / height))
+    nw = max(0.0, min(1.0 - nx, (x2 - x1) / width))
+    nh = max(0.0, min(1.0 - ny, (y2 - y1) / height))
+    return {
+        "flight_session_id": session_id,
+        "track_id": int(track_id),
+        "object_class": label or UNKNOWN_CLASS,
+        "confidence": round(float(confidence or 0.0), 4),
+        "bbox": {
+            "x": round(nx, 5),
+            "y": round(ny, 5),
+            "width": round(nw, 5),
+            "height": round(nh, 5),
+        },
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # One worker per live stream
 # --------------------------------------------------------------------------- #
 
@@ -1154,9 +1342,8 @@ class StreamWorker(threading.Thread):
 
         # Locked track: polled from Supabase (the UI owns the flag) plus the
         # last known normalised box per track, used to build the priority ROI.
-        locked_ids: set[int] = set()
+        lock_trackers: dict[int, LockTracker] = {}
         last_locked_poll = 0.0
-        last_boxes: dict[int, tuple[float, float, float, float]] = {}
 
         try:
             while not self._stop.is_set():
@@ -1248,31 +1435,75 @@ class StreamWorker(threading.Thread):
                             scale,
                         )
 
-                # Locked track priority: analyse a padded crop around the last
-                # known box at native resolution and with a lower threshold, so
-                # the object the user is watching keeps being found through
-                # shake and partial occlusion.
-                lock_count = 0
-                if locked_ids and full_frame_slot["frame"] is not None:
-                    lock_dets, lock_labels = self._detect_locked_rois(
-                        full_frame_slot["frame"], locked_ids, last_boxes
-                    )
-                    if lock_dets is not None and len(lock_dets) > 0:
-                        lock_count = len(lock_dets)
-                        detections, labels = merge_source(
-                            detections, labels, lock_dets, lock_labels, scale
-                        )
-
                 merged_count = len(detections)
                 detections, labels = dedupe_class_aware(detections, labels)
+
+                # ---- Locked objects ---------------------------------------- #
+                # Handled BEFORE the tracker and outside it: each lock is moved
+                # by its own pixel tracker, snapped to the best matching
+                # detection, and every other box sitting on the same object is
+                # removed — so a lock is always exactly one box that stays put
+                # while the camera moves.
+                lock_rows: list[dict] = []
+                if lock_trackers:
+                    keep = np.ones(len(detections), dtype=bool)
+                    for tid, lock in list(lock_trackers.items()):
+                        moved = lock.update(frame)
+                        ious = (
+                            iou_matrix(lock.box.reshape(1, 4), detections.xyxy)[0]
+                            if len(detections)
+                            else np.zeros(0)
+                        )
+                        matched = False
+                        if len(ious) and float(ious.max()) >= LOCK_MATCH_IOU:
+                            best = int(np.argmax(ious))
+                            conf = (
+                                float(detections.confidence[best])
+                                if detections.confidence is not None
+                                else 0.0
+                            )
+                            lock.correct(
+                                frame, detections.xyxy[best], labels[best], conf
+                            )
+                            matched = True
+                        if not matched and not moved:
+                            if now - lock.last_seen > LOCK_GRACE_SECONDS:
+                                log.info("[%s] lock %s released (lost)", self.path, tid)
+                                self.store.clear_lock(self.session_id, tid)
+                                lock_trackers.pop(tid, None)
+                                continue
+                        if len(detections):
+                            cont = containment_matrix(
+                                lock.box.reshape(1, 4), detections.xyxy
+                            )[0]
+                            overlapping = (cont > RANGE_CONTAINMENT) | (
+                                ious > RANGE_DEDUPE_IOU
+                            )
+                            keep &= ~overlapping
+                        lock_rows.append(
+                            lock_row(
+                                self.session_id,
+                                tid,
+                                lock.box,
+                                width,
+                                height,
+                                lock.label,
+                                lock.confidence,
+                            )
+                        )
+                    if not keep.all():
+                        idxs = np.flatnonzero(keep).tolist()
+                        labels = [labels[i] for i in idxs]
+                        detections = detections[idxs]
+
                 if RANGE_DEBUG:
                     log.info(
-                        "[%s] sources: fast=%d range=%d motion=%d lock=%d merged=%d after-dedupe=%d",
+                        "[%s] sources: fast=%d range=%d motion=%d locks=%d merged=%d after-dedupe=%d",
                         self.path,
                         raw_count,
                         range_count,
                         motion_count,
-                        lock_count,
+                        len(lock_trackers),
                         merged_count,
                         len(detections),
                     )
@@ -1281,17 +1512,8 @@ class StreamWorker(threading.Thread):
                     attach_labels(detections, labels)
                 )
                 rows = build_rows(detections, self.session_id, width, height)
-
-                # Remember where each track was (normalised) for the lock ROI.
-                last_boxes = {
-                    int(r["track_id"]): (
-                        r["bbox"]["x"],
-                        r["bbox"]["y"],
-                        r["bbox"]["width"],
-                        r["bbox"]["height"],
-                    )
-                    for r in rows
-                }
+                rows = [r for r in rows if r["track_id"] not in lock_trackers]
+                rows.extend(lock_rows)
 
                 log.info(
                     "[%s] %d raw -> %d tracked -> %d row(s) in %.0f ms",
@@ -1305,13 +1527,35 @@ class StreamWorker(threading.Thread):
                 status.update(self.session_id, active_tracks=len(rows))
                 self.store.upsert(rows)
 
-                # The lock flag is written by the UI — poll it at a low rate.
+                # Locks are created by the UI (on a box, or by clicking anywhere
+                # in the picture) — poll them at a low rate and start a pixel
+                # tracker for each new one.
                 if now - last_locked_poll >= LOCK_POLL_SECONDS:
                     last_locked_poll = now
-                    new_locked = self.store.locked_tracks(self.session_id)
-                    if new_locked != locked_ids:
-                        log.info("[%s] locked tracks: %s", self.path, sorted(new_locked))
-                    locked_ids = new_locked
+                    locked = self.store.locked_tracks(self.session_id)
+                    for tid in list(lock_trackers):
+                        if tid not in locked:
+                            log.info("[%s] lock %s released by user", self.path, tid)
+                            lock_trackers.pop(tid, None)
+                    for tid, row in locked.items():
+                        if tid in lock_trackers:
+                            continue
+                        bbox = row.get("bbox") or {}
+                        try:
+                            bx = float(bbox.get("x", 0.0)) * width
+                            by = float(bbox.get("y", 0.0)) * height
+                            bw = max(4.0, float(bbox.get("width", 0.0)) * width)
+                            bh = max(4.0, float(bbox.get("height", 0.0)) * height)
+                        except (TypeError, ValueError):
+                            continue
+                        lock_trackers[tid] = LockTracker(
+                            tid,
+                            frame,
+                            [bx, by, bx + bw, by + bh],
+                            str(row.get("object_class") or UNKNOWN_CLASS),
+                            float(row.get("confidence") or 0.0),
+                        )
+                        log.info("[%s] lock %s acquired", self.path, tid)
         finally:
             if scanner is not None:
                 scanner.stop()
@@ -1320,60 +1564,6 @@ class StreamWorker(threading.Thread):
             grabber.stop()
             cap.release()
             status.update(self.session_id, connected=False, active_tracks=0)
-
-    def _detect_locked_rois(
-        self,
-        full_frame,
-        locked_ids: set[int],
-        last_boxes: dict[int, tuple[float, float, float, float]],
-    ):
-        """Native-resolution detection inside a padded crop per locked track."""
-        height, width = full_frame.shape[:2]
-        boxes: list[np.ndarray] = []
-        confs: list[float] = []
-        labels: list[str] = []
-        for track_id in locked_ids:
-            box = last_boxes.get(track_id)
-            if not box:
-                continue
-            nx, ny, nw, nh = box
-            pad_w = nw * LOCK_ROI_PADDING
-            pad_h = nh * LOCK_ROI_PADDING
-            x0 = int(max(0, (nx - pad_w) * width))
-            y0 = int(max(0, (ny - pad_h) * height))
-            x1 = int(min(width, (nx + nw + pad_w) * width))
-            y1 = int(min(height, (ny + nh + pad_h) * height))
-            if x1 - x0 < 8 or y1 - y0 < 8:
-                continue
-            crop = full_frame[y0:y1, x0:x1]
-            try:
-                dets, det_labels = self.detector.detect(crop, conf=LOCK_ROI_CONFIDENCE)
-            except Exception as exc:
-                log.warning("[%s] lock ROI failed: %s", self.path, exc)
-                continue
-            if len(dets) == 0:
-                continue
-            xyxy = dets.xyxy.copy()
-            xyxy[:, 0] += x0
-            xyxy[:, 2] += x0
-            xyxy[:, 1] += y0
-            xyxy[:, 3] += y0
-            confidence = (
-                dets.confidence
-                if dets.confidence is not None
-                else np.zeros(len(dets))
-            )
-            boxes.append(xyxy)
-            confs.append(confidence)
-            labels.extend(det_labels)
-        if not boxes:
-            return None, []
-        return (
-            sv.Detections(
-                xyxy=np.concatenate(boxes), confidence=np.concatenate(confs)
-            ),
-            labels,
-        )
 
 
 # --------------------------------------------------------------------------- #
