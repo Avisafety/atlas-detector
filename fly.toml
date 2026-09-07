@@ -57,8 +57,8 @@ primary_region = "ams"
   # Long-range pass: tiled full-resolution analysis at a low cadence, merged
   # into the same tracker. Catches small/distant objects the downscale loses.
   RANGE_PASS_ENABLED = "true"
-  RANGE_PASS_INTERVAL_SECONDS = "2.0"
-  RANGE_TILE_COLS = "3"
+  RANGE_PASS_INTERVAL_SECONDS = "4.0"
+  RANGE_TILE_COLS = "2"
   RANGE_TILE_ROWS = "2"
   RANGE_TILE_OVERLAP = "0.15"
   RANGE_CONFIDENCE = "0.15"
