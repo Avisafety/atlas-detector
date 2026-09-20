@@ -474,7 +474,7 @@ class DetectionStore:
         """Active flights that currently have an Atlas video stream.
 
         A flight qualifies when its drone has registered at least one sensor
-        through /atlas-video-endpoint recently. EO (sensor 1) wins when the
+        through /atlas-video-endpoint. EO (sensor 1) wins when the
         drone publishes both, since that is what the UI opens by default.
         """
         try:
@@ -494,15 +494,11 @@ class DetectionStore:
         if not drone_ids:
             return []
 
-        cutoff = (
-            datetime.now(timezone.utc) - timedelta(seconds=SENSOR_STALE_SECONDS)
-        ).isoformat()
         try:
             sensors = (
                 self.client.table("atlas_drone_sensors")
-                .select("drone_id, serial, sensor, last_seen_at")
+                .select("drone_id, serial, sensor")
                 .in_("drone_id", drone_ids)
-                .gte("last_seen_at", cutoff)
                 .execute()
                 .data
                 or []
@@ -514,7 +510,6 @@ class DetectionStore:
         by_drone: dict[str, dict] = {}
         for row in sensors:
             current = by_drone.get(row["drone_id"])
-            # Prefer EO (1), otherwise the lowest sensor number available.
             if current is None or int(row["sensor"]) < int(current["sensor"]):
                 by_drone[row["drone_id"]] = row
 
