@@ -75,6 +75,11 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("atlas-detector")
+# httpx logs every Supabase request at INFO — ~5 lines/s from the prune loop
+# alone — which buried the per-stream summaries and shrank Fly's log buffer to
+# ~20 seconds. Failed requests still surface through our own warnings.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # --------------------------------------------------------------------------- #
 # Configuration

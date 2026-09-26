@@ -73,6 +73,12 @@ primary_region = "ams"
   # Temporary: set to "true" to log per-source counts and each suppression.
   RANGE_DEBUG = "false"
 
+  # Logging: one summary line per stream every 10 s. OpenCV's own warnings
+  # (e.g. "can't be used to capture by name" after every failed RTSP open)
+  # are noise next to the detector's "stream error" line.
+  LOG_SUMMARY_SECONDS = "10"
+  OPENCV_LOG_LEVEL = "ERROR"
+
 [[vm]]
   # Dedicated CPU — on shared CPU the machine, not the code, caps the frame rate.
   size = "performance-2x"
