@@ -41,7 +41,14 @@ fly releases -a atlas-detector --image       # versions + image refs, for rollba
 fly secrets list -a atlas-detector           # names only
 ```
 
-Deploy (always from the repo root, after the checks below):
+Deploy — preferred path: GitHub Actions workflow "Deploy to Fly"
+(`.github/workflows/deploy.yml`, manual `workflow_dispatch`, main only; the
+app-scoped deploy token lives in the repo secret `FLY_API_TOKEN`). Merge to
+main, then trigger it (owner in the GitHub app, or `actions_run_trigger` via
+the GitHub MCP tools after the owner's yes) and follow the run.
+
+Direct deploy from a session only works with a token that can reach Fly's
+builder app (an app-scoped token gets "remote builder app unavailable"):
 
 ```sh
 fly deploy --remote-only --depot=false -a atlas-detector

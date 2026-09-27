@@ -1,0 +1,52 @@
+# Deploy atlas-detector to Fly.io — manual only.
+#
+# Run from GitHub: Actions -> "Deploy to Fly" -> Run workflow (branch: main).
+# Only `main` can be deployed, so production always equals main.
+#
+# Needs the repository secret FLY_API_TOKEN: a deploy token scoped to the
+# atlas-detector app (Fly dashboard -> atlas-detector -> Tokens). It lives
+# only in GitHub; builds run on Fly's default (Depot) builder, which accepts
+# an app-scoped token.
+
+name: Deploy to Fly
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "What is being deployed (shown in the run log)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fly-deploy-atlas-detector
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Before
+        env:
+          REASON: ${{ github.event.inputs.reason }}  # via env, never inlined into the script
+        run: |
+          echo "Deploying ${GITHUB_SHA::7}: ${REASON}"
+          flyctl status -a atlas-detector
+          flyctl releases -a atlas-detector --image | head -4
+
+      - name: Deploy
+        run: flyctl deploy --remote-only -a atlas-detector
+
+      - name: After
+        run: flyctl status -a atlas-detector
