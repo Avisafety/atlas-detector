@@ -12,11 +12,18 @@ architecture and every environment variable.
 - The owner (Gard, AviSafe) writes in Norwegian and works from an iPad: no
   local terminal. Answer in Norwegian, keep instructions tappable (dashboard
   paths, not shell commands they must run).
-- Never deploy, change secrets, scale or restart machines without an explicit
-  "yes" in the conversation. A deploy takes the detector down for ~1 minute —
-  check whether a flight is being tested first (`fly logs`).
-- Work on the session's feature branch; `main` is what production was last
-  deployed from. Do not push to `main`.
+- The owner has authorised Claude to push to `main` and to deploy through the
+  "Deploy to Fly" GitHub Actions workflow once a change is tested (27 Sep
+  2026). Develop on the session branch, run the checks below, then push to
+  main and trigger the workflow. Before triggering, check for an active
+  stream (`fly logs`): a deploy takes the detector down for ~1 minute — if a
+  flight or test is running, ask first. Say in the conversation what is being
+  deployed and report the result.
+- Still never change secrets, scale or restart machines, or deploy
+  `live-video`, without an explicit "yes" in the conversation.
+- `main` must always equal production: push to main only what you deploy.
+- The owner can also deploy from the Fly dashboard (GitHub integration,
+  manual); it is not automatic on push.
 
 ## Fly.io
 
@@ -43,9 +50,10 @@ fly secrets list -a atlas-detector           # names only
 
 Deploy — preferred path: GitHub Actions workflow "Deploy to Fly"
 (`.github/workflows/deploy.yml`, manual `workflow_dispatch`, main only; the
-app-scoped deploy token lives in the repo secret `FLY_API_TOKEN`). Merge to
-main, then trigger it (owner in the GitHub app, or `actions_run_trigger` via
-the GitHub MCP tools after the owner's yes) and follow the run.
+app-scoped deploy token lives in the repo secret `FLY_API_TOKEN`). Push to
+main, then trigger it with `actions_run_trigger` (GitHub MCP tools, workflow
+`deploy.yml`, ref `main`) and follow the run with `actions_get` /
+`get_job_logs`. The owner can also run it from the GitHub app.
 
 Direct deploy from a session only works with a token that can reach Fly's
 builder app (an app-scoped token gets "remote builder app unavailable"):
