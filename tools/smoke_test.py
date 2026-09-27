@@ -42,7 +42,28 @@ def make_frames(n=100, w=1920, h=1080):
         out.append(f)
     return out
 
-FRAMES = make_frames()
+def make_pan_frames(n=100, w=1920, h=1080, amp=400):
+    """Static scene, moving camera: a textured canvas (corners for optical
+    flow) with the objects fixed in scene coordinates, and a view window that
+    sweeps +-amp px sideways (up to ~25 px per frame) — what a panning gimbal
+    looks like to the detector."""
+    rng = np.random.default_rng(1)
+    cw, ch = w + 2 * amp, h + 200
+    canvas = np.full((ch, cw, 3), 100, np.uint8)
+    for _ in range(900):  # random blocks = lots of trackable corners
+        x, y = int(rng.integers(0, cw - 40)), int(rng.integers(0, ch - 40))
+        bw, bh = int(rng.integers(8, 60)), int(rng.integers(8, 60))
+        canvas[y:y + bh, x:x + bw] = rng.integers(40, 200)
+    zz = cv2.resize(zid, (640, 360)); bb = cv2.resize(bus, (135, 180))
+    canvas[300:660, amp + 500:amp + 1140] = zz
+    canvas[850:1030, amp + 1500:amp + 1635] = bb
+    out = []
+    for i in range(n):
+        ox = amp + int(amp * np.sin(2 * np.pi * i / n))
+        out.append(canvas[100:100 + h, ox:ox + w].copy())
+    return out
+
+FRAMES = make_pan_frames() if os.environ.get('H_PAN') == '1' else make_frames()
 
 class FakeCap:
     def __init__(self, fps=25):
@@ -176,6 +197,21 @@ classes = collections.Counter(r['object_class'] for _, rows in up for r in rows)
 ids = collections.Counter(r['track_id'] for _, rows in up for r in rows)
 print(f'RESULT upserts/s={len(up)/span:.1f} rows/upsert={np.mean([len(r) for _,r in up]):.2f} '
       f'distinct_track_ids={len(ids)} classes={dict(classes.most_common(6))}')
+# Track stability: distinct ids per class and how long an id lives (upserts
+# it appears in). Fewer ids / longer lives = fewer identity switches.
+if up:
+    per_id = collections.Counter(r['track_id'] for _, rows in up for r in rows)
+    cls_of = {r['track_id']: r['object_class'] for _, rows in up for r in rows}
+    by_cls = collections.defaultdict(list)
+    for tid, cnt in per_id.items():
+        by_cls[cls_of[tid]].append(cnt)
+    if os.environ.get('H_IDS_DETAIL') == '1':
+        size = {}
+        for _, rows in up:
+            for r in rows:
+                size.setdefault(r['track_id'], (round(r['bbox']['width'] * 640), round(r['bbox']['height'] * 360)))
+        print('IDS_DETAIL', sorted(((cls_of[t], per_id[t], size[t]) for t in per_id), key=lambda x: -x[1])[:12])
+    print('IDS ' + ' '.join(f"{c}:{len(v)} ids (median life {int(np.median(v))} frames)" for c, v in sorted(by_cls.items())))
 bc = [b for b in BROADCASTS if b[0] > t0 + 15]
 if bc:
     msgs = [m for _, body in bc for m in body['messages']]

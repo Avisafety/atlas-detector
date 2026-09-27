@@ -120,7 +120,14 @@ download.pytorch.org are blocked), so:
   `FLY_TOKEN_LIVE_VIDEO` for it.
 - The Lovable project must never edit or deploy a copy of this detector; the
   detector is maintained only here.
-- Planned next: track-guided native-resolution crops for range, camera-motion
-  compensation in the tracker (supervision's ByteTrack is deprecated and
-  removed in 0.31 — pinned to 0.30.2), and a lease table so several machines
-  can share many streams.
+- Tracker: BoT-SORT + MaskedFlowGMC (README "Tracking with a moving camera").
+  `TRACKER_IMPL=bytetrack` is the rollback. Use `H_PAN=1` (camera pan) and
+  `H_IDS_DETAIL=1` in tools/smoke_test.py to check id stability; compare
+  against the previous app.py. DETECTION_CONFIDENCE secret: owner staged 0.2
+  (was 0.35) to go out with the tracker release.
+- Known: distant objects seen only by the range pass (every 4 s) still get
+  short tracks between scans — round 3 (track-guided native-resolution
+  crops) fixes that. Lock labels come from the last matching detection and
+  can flip (no voting for locks yet).
+- Planned next: round 3 range crops; later a lease table so several machines
+  can share many streams; custom training on own footage (not now).

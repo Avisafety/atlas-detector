@@ -55,6 +55,32 @@ when a stream drops. Messages go over one persistent Realtime websocket
 endpoint (~110 ms). Viewers are authorised by the RLS policy on
 `realtime.messages`.
 
+## Tracking with a moving camera
+
+`TRACKER_IMPL=botsort` (default) runs Ultralytics BoT-SORT with our own
+background-only motion compensation (`MaskedFlowGMC`): sparse optical flow on
+the fast frame downscaled to 160×90, with every detected box masked out, so a
+large moving object cannot pose as camera motion. When too few background
+points agree (open sea, fog) no compensation is applied rather than a wrong
+one. Tracks are moved with the camera before matching, so a gimbal pan no
+longer breaks them into new ids.
+
+- Detections ≥ `TRACK_HIGH_THRESH` (0.25) start and extend tracks; those
+  between `TRACK_LOW_THRESH` (0.10) and HIGH only extend existing tracks.
+  New tracks need `NEW_TRACK_THRESH` and two consecutive frames.
+- A range / motion result may open tracks only on its first
+  `NEW_RESULT_FRAMES` (2) frames; its re-fed copies are moved with the camera
+  since then and can only extend tracks. Range boxes larger than
+  `RANGE_NEW_TRACK_MAX_SIDE` (64 px) never open a track — the fast pass owns
+  large objects. On overlap a fresh detection always beats a re-fed copy.
+- The published class is a confidence-weighted vote over the last
+  `CLASS_VOTE_WINDOW` detections of the track.
+- `TRACKER_IMPL=bytetrack` restores the previous supervision ByteTrack exactly.
+
+Measured with `tools/smoke_test.py` (two people + a small distant bus): static
+camera 23 → 2 person ids, panning camera (`H_PAN=1`) 35 → 2, each id lasting
+the whole run; motion compensation costs ~3 ms per frame.
+
 ## Two cooperating passes, one tracker
 
 - **Fast pass** — the whole frame downscaled to `INFER_MAX_SIDE` (default 640),
@@ -134,6 +160,12 @@ fly secrets set \
 | `LOG_SUMMARY_SECONDS` | `10` | Interval of the per-stream summary log line and `/health` metrics |
 | `LOG_EVERY_FRAME` | `false` | Also log one line per analysed frame (very verbose) |
 | `DB_WRITER_THREADS` | `MAX_STREAMS` | Parallel Supabase writers (one per stream slot) |
+| `TRACKER_IMPL` | `botsort` | `botsort` (motion-compensated) or `bytetrack` (previous) |
+| `TRACKER_GMC` | `maskedFlow` | `maskedFlow`, Ultralytics `sparseOptFlow` / `orb` / `ecc`, or `none` |
+| `TRACK_HIGH_THRESH` / `TRACK_LOW_THRESH` / `NEW_TRACK_THRESH` | `0.25` / `0.10` / `0.25` | See "Tracking with a moving camera" |
+| `RANGE_NEW_TRACK_MAX_SIDE` | `64` | Largest range box (px, fast frame) allowed to open a track |
+| `CLASS_VOTE_WINDOW` | `10` | Detections per track used for the class vote |
+| `LOCK_REINIT_IOU` | `0.6` | Re-anchor a lock's pixel tracker only below this IoU with its detection |
 | `IDLE_EXIT_MINUTES` | `0` (fly.toml: `10`) | Exit after this long without an analysed frame so the Fly machine sleeps; `0` = never |
 | `DETECTIONS_TRANSPORT` | `both` | `postgres`, `broadcast` or `both` (see above) |
 | `BROADCAST_MAX_HZ` | `10` | Broadcast snapshots per second per stream |
