@@ -65,8 +65,8 @@ fly deploy --remote-only --depot=false -a atlas-detector
   (`fly config show -a atlas-detector`) so a deploy never silently changes
   env values that were set another way.
 
-Secrets override `fly.toml` `[env]`: `DETECTION_CONFIDENCE` (0.35 in
-production, not the 0.20 in fly.toml) and `SENSOR_STALE_SECONDS` are secrets.
+Secrets override `fly.toml` `[env]`: `DETECTION_CONFIDENCE` (0.2 in
+production since v60) and `SENSOR_STALE_SECONDS` are secrets.
 
 The app has no public IP on purpose (`/health` exposes flight ids and drone
 serials). Read it from inside the machine:
@@ -130,8 +130,10 @@ download.pytorch.org are blocked), so:
 - Tracker: BoT-SORT + MaskedFlowGMC (README "Tracking with a moving camera").
   `TRACKER_IMPL=bytetrack` is the rollback. Use `H_PAN=1` (camera pan) and
   `H_IDS_DETAIL=1` in tools/smoke_test.py to check id stability; compare
-  against the previous app.py. DETECTION_CONFIDENCE secret: owner staged 0.2
-  (was 0.35) to go out with the tracker release.
+  against the previous app.py. Live since v60 (deployed via the GitHub Actions
+  workflow) with DETECTION_CONFIDENCE=0.2 (secret, was 0.35).
+- Fly tokens are "FlyV1 fm2_..." — the space after FlyV1 is part of the
+  token; without it Fly answers Unauthorized.
 - Known: distant objects seen only by the range pass (every 4 s) still get
   short tracks between scans — round 3 (track-guided native-resolution
   crops) fixes that. Lock labels come from the last matching detection and
