@@ -141,11 +141,35 @@ if hasattr(app, "Broadcaster"):  # older app.py versions have no broadcast
     app.Broadcaster._post = fake_post
 app.open_capture = lambda url: FakeCap()
 N = int(os.environ.get('H_STREAMS', '1'))
+# Scale-to-zero checks: H_NO_STREAMS=1 (discovery finds nothing) or
+# H_DEAD_STREAM=1 (an active flight whose RTSP stream cannot be opened).
+if os.environ.get('H_NO_STREAMS') == '1' or os.environ.get('H_DEAD_STREAM') == '1':
+    os.environ.pop('MEDIAMTX_RTSP_URL'); app.RTSP_URL = ''
+    if os.environ.get('H_DEAD_STREAM') == '1':
+        app.DetectionStore.live_streams = lambda self: [{'flight_session_id': 'dead', 'path': 'gone/1'}]
+        app.open_capture = lambda url: None
+    else:
+        app.DetectionStore.live_streams = lambda self: []
 if N > 1:
     os.environ.pop('MEDIAMTX_RTSP_URL'); app.RTSP_URL = ''; app.MAX_STREAMS = N
     app.DetectionStore.live_streams = lambda self: [{'flight_session_id': f's{i}', 'path': f'drone{i}/1'} for i in range(N)]
-threading.Thread(target=app.main, daemon=True).start()
-t0 = time.time(); time.sleep(SECONDS)
+main_thread = threading.Thread(target=app.main, daemon=True)
+main_thread.start()
+t0 = time.time()
+EXITED = []
+def _watch():
+    main_thread.join(); EXITED.append(time.time() - t0)
+threading.Thread(target=_watch, daemon=True).start()
+WAKE_AT = float(os.environ.get('H_WAKE_AT', '0') or 0)  # send GET /wake after N s
+if WAKE_AT:
+    time.sleep(WAKE_AT)
+    print('WAKE', urllib.request.urlopen('http://127.0.0.1:8080/wake', timeout=2).read().decode(), f'at {time.time()-t0:.1f}s')
+    time.sleep(max(0, SECONDS - WAKE_AT))
+else:
+    time.sleep(SECONDS)
+print(f"MAIN {'exited after %.1fs' % EXITED[0] if EXITED else 'still running'}")
+if not any(u[0] > t0 for u in Store.upserts) and not BROADCASTS and not WS_MESSAGES:
+    sys.exit(0)
 up = [u for u in Store.upserts if u[0] > t0 + 15]  # skip warm-up
 span = max(1e-6, up[-1][0] - up[0][0]) if len(up) > 1 else 1
 classes = collections.Counter(r['object_class'] for _, rows in up for r in rows)

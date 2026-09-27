@@ -21,10 +21,18 @@ primary_region = "ams"
 
 [http_service]
   internal_port = 8080
-  force_https = true
+  # No public IP: the only way in is the private Flycast address
+  # (atlas-detector.flycast), plain HTTP inside the Fly organisation.
+  force_https = false
+  # Scale to zero. The proxy must never stop the machine itself — the
+  # detector receives no inbound traffic while it analyses (it pulls RTSP), so
+  # the proxy would think it idle mid-flight. Instead the app exits after
+  # IDLE_EXIT_MINUTES without video (restart policy on-failure → stopped), and
+  # a request to http://atlas-detector.flycast/wake (sent by MediaMTX when a
+  # drone publishes or a viewer starts watching) makes the proxy start it.
   auto_stop_machines = "off"
   auto_start_machines = true
-  min_machines_running = 1
+  min_machines_running = 0
 
   [[http_service.checks]]
     grace_period = "60s"
@@ -80,6 +88,9 @@ primary_region = "ams"
   # Broadcast snapshots per second per stream (frontend glides boxes with
   # vx/vy in between). Keeps Realtime's messages/s quota comfortable.
   BROADCAST_MAX_HZ = "10"
+
+  # Sleep after 10 minutes without video; woken through /wake (see above).
+  IDLE_EXIT_MINUTES = "10"
 
   # Logging: one summary line per stream every 10 s. OpenCV's own warnings
   # (e.g. "can't be used to capture by name" after every failed RTSP open)

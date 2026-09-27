@@ -85,13 +85,28 @@ download.pytorch.org are blocked), so:
 - Test streams from the Larix phone app arrive in bursts (~200 ms gaps), which
   caps analysis at ~8 fps. The owner reports that video from the Atlas
   controller looks normal — not yet measured with the frame-gap probe.
-- Broadcast transport (README "Getting boxes to the browser") runs in
-  `both` mode; the frontend (Lovable project, separate repo) consumes the
-  `tracks` snapshots and falls back to Postgres Changes. Switch
-  `DETECTIONS_TRANSPORT` to `broadcast` once verified in a real flight;
-  `postgres` is the instant rollback. Measured from Fly: websocket ~10 ms per
-  message, REST fallback ~110 ms. Supabase plan: Pro, micro compute — mind the
-  Realtime messages/s quota (counted per recipient).
+- Production (v58, deployed from `main` at d258eed) runs
+  DETECTIONS_TRANSPORT=broadcast: boxes reach the browser only through the
+  private Realtime channel (frontend HUD shows BROADCAST · SUBSCRIBED); only
+  locked tracks are written to atlas_detections. `both` / `postgres` are the
+  rollback. Measured from Fly: websocket ~10-15 ms per message, REST fallback
+  ~110 ms. Supabase plan: Pro, micro compute — mind the Realtime messages/s
+  quota (counted per recipient).
+- Open issue on the frontend side: locking a detected (positive id) box uses
+  an upsert that the atlas_detections INSERT policy (track_id < 0) rejects.
+  The fix is a SECURITY DEFINER RPC (lock_detection/unlock_detection) in the
+  Lovable project, not a detector change.
+- Scale to zero (v59): the detector exits after IDLE_EXIT_MINUTES=10 without
+  video and the machine stops (min_machines_running = 0). MediaMTX in the
+  `live-video` app (repo Avisafety/live_video, `mediamtx.yml` runOnReady /
+  runOnRead) wakes it with `wget http://atlas-detector.flycast/wake`; the
+  private Flycast IP is fdaa:38:d7df:0:1::2. A stopped machine is normal —
+  `fly status` showing "stopped" between flights is not an outage. Test the
+  wake path with
+  `fly ssh console -a live-video -C "wget -T 20 -O - http://atlas-detector.flycast/wake"`.
+  Deploying live-video interrupts all video briefly (publishers reconnect);
+  do it only with the owner's yes and preferably when nobody is flying. It
+  has its own deploy token in the environment.
 - The Lovable project must never edit or deploy a copy of this detector; the
   detector is maintained only here.
 - Planned next: track-guided native-resolution crops for range, camera-motion
