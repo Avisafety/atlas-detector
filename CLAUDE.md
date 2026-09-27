@@ -85,13 +85,17 @@ download.pytorch.org are blocked), so:
 - Test streams from the Larix phone app arrive in bursts (~200 ms gaps), which
   caps analysis at ~8 fps. The owner reports that video from the Atlas
   controller looks normal — not yet measured with the frame-gap probe.
-- Broadcast transport (README "Getting boxes to the browser") runs in
-  `both` mode; the frontend (Lovable project, separate repo) consumes the
-  `tracks` snapshots and falls back to Postgres Changes. Switch
-  `DETECTIONS_TRANSPORT` to `broadcast` once verified in a real flight;
-  `postgres` is the instant rollback. Measured from Fly: websocket ~10 ms per
-  message, REST fallback ~110 ms. Supabase plan: Pro, micro compute — mind the
-  Realtime messages/s quota (counted per recipient).
+- Production (v58, deployed from `main` at d258eed) runs
+  DETECTIONS_TRANSPORT=broadcast: boxes reach the browser only through the
+  private Realtime channel (frontend HUD shows BROADCAST · SUBSCRIBED); only
+  locked tracks are written to atlas_detections. `both` / `postgres` are the
+  rollback. Measured from Fly: websocket ~10-15 ms per message, REST fallback
+  ~110 ms. Supabase plan: Pro, micro compute — mind the Realtime messages/s
+  quota (counted per recipient).
+- Open issue on the frontend side: locking a detected (positive id) box uses
+  an upsert that the atlas_detections INSERT policy (track_id < 0) rejects.
+  The fix is a SECURITY DEFINER RPC (lock_detection/unlock_detection) in the
+  Lovable project, not a detector change.
 - The Lovable project must never edit or deploy a copy of this detector; the
   detector is maintained only here.
 - Planned next: track-guided native-resolution crops for range, camera-motion
