@@ -27,6 +27,34 @@ sensor registered in `atlas_drone_sensors`, and starts one worker per stream
 (up to `MAX_STREAMS`). Workers stop — and their boxes are deleted — when the
 flight ends or the stream goes stale.
 
+## Getting boxes to the browser
+
+`DETECTIONS_TRANSPORT` selects the path:
+
+| Value | What happens |
+|---|---|
+| `postgres` | Every track is upserted into `atlas_detections`; the frontend listens to Postgres Changes (the original behaviour). |
+| `broadcast` | One Supabase Realtime **Broadcast** snapshot per frame on the private channel `atlas-detections:<flight_session_id>` (event `tracks`). Only locked tracks are still written to the table. |
+| `both` | Both at once — for the transition; the frontend prefers Broadcast. |
+
+Snapshot payload (a track missing from a snapshot is gone):
+
+```json
+{ "v": 1, "flight_session_id": "uuid", "sent_at": 1727330000123,
+  "tracks": [ { "id": 17, "cls": "person", "conf": 0.84,
+                "x": 0.41, "y": 0.22, "w": 0.05, "h": 0.12,
+                "vx": 0.012, "vy": -0.003, "locked": false } ] }
+```
+
+Coordinates are normalised (top-left + size), `vx`/`vy` in normalised units
+per second so the frontend can glide boxes between snapshots. Snapshots are
+throttled to `BROADCAST_MAX_HZ`; with nothing detected an empty keep-alive is
+sent every `BROADCAST_IDLE_SECONDS`, and an empty snapshot is sent right away
+when a stream drops. Messages go over one persistent Realtime websocket
+(~10 ms each from Fly); while it is down they fall back to the Realtime REST
+endpoint (~110 ms). Viewers are authorised by the RLS policy on
+`realtime.messages`.
+
 ## Two cooperating passes, one tracker
 
 - **Fast pass** — the whole frame downscaled to `INFER_MAX_SIDE` (default 640),
@@ -106,6 +134,11 @@ fly secrets set \
 | `LOG_SUMMARY_SECONDS` | `10` | Interval of the per-stream summary log line and `/health` metrics |
 | `LOG_EVERY_FRAME` | `false` | Also log one line per analysed frame (very verbose) |
 | `DB_WRITER_THREADS` | `MAX_STREAMS` | Parallel Supabase writers (one per stream slot) |
+| `DETECTIONS_TRANSPORT` | `both` | `postgres`, `broadcast` or `both` (see above) |
+| `BROADCAST_MAX_HZ` | `10` | Broadcast snapshots per second per stream |
+| `BROADCAST_IDLE_SECONDS` | `1.0` | Keep-alive interval for empty snapshots |
+| `BROADCAST_TOPIC_PREFIX` | `atlas-detections:` | Channel name prefix (+ flight_session_id) |
+| `BROADCAST_EVENT` | `tracks` | Broadcast event name |
 
 ## Health
 

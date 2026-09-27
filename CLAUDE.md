@@ -71,7 +71,10 @@ download.pytorch.org are blocked), so:
    blocked), export the ONNX model the same way the Dockerfile does, then run
    `tools/smoke_test.py` pinned to 2 cores (`taskset -c 0,1`) against both the
    old and the new `app.py` — 1 stream, `H_STREAMS=3` and `H_LOCK=1`. Compare
-   fps, rows per upsert, classes and that the range pass still reports.
+   fps, rows per upsert, classes and that the range pass still reports. For
+   the broadcast path add `H_WS=1` (fake Realtime websocket server) and
+   `H_WS_DROP=1` (connection drop + reconnect), and run each
+   `DETECTIONS_TRANSPORT` value.
 3. `python bench.py <image>` checks that the PyTorch and ONNX backends agree.
 4. `fly deploy --build-only --remote-only --depot=false` to prove the image
    builds on Fly.
@@ -82,7 +85,16 @@ download.pytorch.org are blocked), so:
 - Test streams from the Larix phone app arrive in bursts (~200 ms gaps), which
   caps analysis at ~8 fps. The owner reports that video from the Atlas
   controller looks normal — not yet measured with the frame-gap probe.
-- Planned next: Supabase Realtime Broadcast instead of Postgres Changes for
-  the overlay (frontend in Lovable), track-guided native-resolution crops for
-  range, camera-motion compensation in the tracker, and a lease table so
-  several machines can share many streams.
+- Broadcast transport (README "Getting boxes to the browser") runs in
+  `both` mode; the frontend (Lovable project, separate repo) consumes the
+  `tracks` snapshots and falls back to Postgres Changes. Switch
+  `DETECTIONS_TRANSPORT` to `broadcast` once verified in a real flight;
+  `postgres` is the instant rollback. Measured from Fly: websocket ~10 ms per
+  message, REST fallback ~110 ms. Supabase plan: Pro, micro compute — mind the
+  Realtime messages/s quota (counted per recipient).
+- The Lovable project must never edit or deploy a copy of this detector; the
+  detector is maintained only here.
+- Planned next: track-guided native-resolution crops for range, camera-motion
+  compensation in the tracker (supervision's ByteTrack is deprecated and
+  removed in 0.31 — pinned to 0.30.2), and a lease table so several machines
+  can share many streams.

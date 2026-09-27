@@ -6,3 +6,5 @@ numpy==1.26.4
 onnx==1.23.0
 onnxslim==0.1.96
 onnxruntime==1.30.0
+httpx==0.28.1
+websockets==15.0.1

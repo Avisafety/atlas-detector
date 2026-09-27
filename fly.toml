@@ -73,6 +73,14 @@ primary_region = "ams"
   # Temporary: set to "true" to log per-source counts and each suppression.
   RANGE_DEBUG = "false"
 
+  # How boxes reach the browser: "both" during the transition (Broadcast +
+  # atlas_detections), then "broadcast" (only locked tracks in the table).
+  # "postgres" is the old behaviour and the instant rollback.
+  DETECTIONS_TRANSPORT = "both"
+  # Broadcast snapshots per second per stream (frontend glides boxes with
+  # vx/vy in between). Keeps Realtime's messages/s quota comfortable.
+  BROADCAST_MAX_HZ = "10"
+
   # Logging: one summary line per stream every 10 s. OpenCV's own warnings
   # (e.g. "can't be used to capture by name" after every failed RTSP open)
   # are noise next to the detector's "stream error" line.

@@ -95,7 +95,36 @@ class FakeClient:
             q.execute = ex
         return q
 
-os.environ.update(SUPABASE_URL='http://fake', SUPABASE_SERVICE_ROLE_KEY='x',
+# H_WS=1: run a fake Supabase Realtime (Phoenix) websocket server locally, so
+# the websocket path is exercised; otherwise the socket cannot connect and
+# broadcasts go through the (fake) REST fallback.
+WS_MESSAGES = []  # (t, decoded frame)
+WS_URL = 'http://fake'
+if os.environ.get('H_WS') == '1':
+    import asyncio
+    import websockets
+
+    async def _phoenix(ws):
+        if os.environ.get('H_WS_DROP') == '1':  # drop the first connection after 20 s
+            asyncio.get_running_loop().call_later(20, lambda: asyncio.ensure_future(ws.close()))
+        async for raw in ws:
+            msg = json.loads(raw)
+            WS_MESSAGES.append((time.time(), msg))
+            if msg['event'] in ('phx_join', 'broadcast', 'heartbeat', 'phx_leave'):
+                await asyncio.sleep(0.01)
+                await ws.send(json.dumps({'topic': msg['topic'], 'event': 'phx_reply', 'ref': msg['ref'],
+                                          'payload': {'status': 'ok', 'response': {}}}))
+
+    def _serve():
+        loop = asyncio.new_event_loop()
+        async def main():
+            async with websockets.serve(_phoenix, '127.0.0.1', 8765):
+                await asyncio.Future()
+        loop.run_until_complete(main())
+    threading.Thread(target=_serve, daemon=True).start()
+    WS_URL = 'http://127.0.0.1:8765'
+
+os.environ.update(SUPABASE_URL=WS_URL, SUPABASE_SERVICE_ROLE_KEY='x',
                   MEDIAMTX_RTSP_URL='fake://stream', FLIGHT_SESSION_ID='test-session',
                   DETECTION_FPS='20', TRACKER_LOST_BUFFER='10', TRACK_TTL_SECONDS='0.2',
                   RANGE_PASS_INTERVAL_SECONDS='4.0', RANGE_TILE_COLS='2', RANGE_TILE_ROWS='2',
@@ -103,6 +132,13 @@ os.environ.update(SUPABASE_URL='http://fake', SUPABASE_SERVICE_ROLE_KEY='x',
 spec = importlib.util.spec_from_file_location('app', APP)
 app = importlib.util.module_from_spec(spec); spec.loader.exec_module(app)
 app.create_client = lambda *a, **k: FakeClient()
+BROADCASTS = []  # (t, body)
+def fake_post(self, client, body):
+    time.sleep(0.04)  # typical Realtime REST round trip
+    BROADCASTS.append((time.time(), body))
+    return 202
+if hasattr(app, "Broadcaster"):  # older app.py versions have no broadcast
+    app.Broadcaster._post = fake_post
 app.open_capture = lambda url: FakeCap()
 N = int(os.environ.get('H_STREAMS', '1'))
 if N > 1:
@@ -116,9 +152,30 @@ classes = collections.Counter(r['object_class'] for _, rows in up for r in rows)
 ids = collections.Counter(r['track_id'] for _, rows in up for r in rows)
 print(f'RESULT upserts/s={len(up)/span:.1f} rows/upsert={np.mean([len(r) for _,r in up]):.2f} '
       f'distinct_track_ids={len(ids)} classes={dict(classes.most_common(6))}')
+bc = [b for b in BROADCASTS if b[0] > t0 + 15]
+if bc:
+    msgs = [m for _, body in bc for m in body['messages']]
+    tr = [len(m['payload']['tracks']) for m in msgs]
+    moving = [t for m in msgs for t in m['payload']['tracks'] if abs(t['vx']) > 0.01]
+    print(f"BROADCAST msgs/s={len(bc)/max(1e-6, bc[-1][0]-bc[0][0]):.1f} tracks/msg={np.mean(tr):.2f} "
+          f"topics={sorted({m['topic'] for m in msgs})} events={sorted({m['event'] for m in msgs})} "
+          f"private={all(m['private'] for m in msgs)} moving_tracks={len(moving)} "
+          f"locked_seen={any(t['locked'] for m in msgs for t in m['payload']['tracks'])}")
+    print('SAMPLE', json.dumps(msgs[-1]['payload'])[:400])
+else:
+    print('BROADCAST (rest) none')
+ws = [m for t, m in WS_MESSAGES if t > t0 + 15]
+if ws:
+    b = [m for m in ws if m['event'] == 'broadcast']
+    joins = [m for _, m in WS_MESSAGES if m['event'] == 'phx_join']
+    span = max(1e-6, ws[-1][0] - ws[0][0]) if False else max(1e-6, SECONDS - 15)
+    print(f"WEBSOCKET broadcasts/s={len(b)/span:.1f} joins={len(joins)} "
+          f"join_private={all(j['payload']['config']['private'] for j in joins)} "
+          f"topics={sorted({m['topic'] for m in b})} "
+          f"tracks/msg={np.mean([len(m['payload']['payload']['tracks']) for m in b]):.2f}")
 try:
     h = json.load(urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2))
-    print('HEALTH', json.dumps({k: h[k] for k in ('model', 'db_writer')}))
+    print('HEALTH', json.dumps({k: h.get(k) for k in ('model', 'transport', 'db_writer', 'broadcast')}))
     for st in h['streams']: print('  ', st['path'], json.dumps(st.get('metrics')))
 except Exception as e:
     print('HEALTH ERR', e)

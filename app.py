@@ -56,6 +56,7 @@ CPU only. Everything is configured through environment variables:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -236,6 +237,25 @@ LOG_EVERY_FRAME = os.environ.get("LOG_EVERY_FRAME", "false").lower() == "true"
 # Parallel Supabase writer threads (one lane per stream slot by default).
 DB_WRITER_THREADS = int(os.environ.get("DB_WRITER_THREADS", "0") or 0) or MAX_STREAMS
 
+# How boxes reach the browser:
+#   postgres  — upsert every track into atlas_detections (Postgres Changes)
+#   broadcast — one Realtime Broadcast snapshot per frame on a private
+#               channel; only LOCKED tracks are still written to the table
+#   both      — do both (transition period; frontend picks broadcast)
+DETECTIONS_TRANSPORT = os.environ.get("DETECTIONS_TRANSPORT", "both").strip().lower()
+if DETECTIONS_TRANSPORT not in ("postgres", "broadcast", "both"):
+    DETECTIONS_TRANSPORT = "both"
+BROADCAST_ENABLED = DETECTIONS_TRANSPORT in ("broadcast", "both")
+# Snapshots per second per stream. The frontend extrapolates with vx/vy, so
+# 10 Hz looks smooth while keeping Realtime's messages/second quota (counted
+# per recipient) far away. Analysis itself still runs at DETECTION_FPS.
+BROADCAST_MAX_HZ = float(os.environ.get("BROADCAST_MAX_HZ", "10") or 10)
+# With nothing to show, a keep-alive empty snapshot this often lets the
+# frontend know Broadcast is alive without spending quota.
+BROADCAST_IDLE_SECONDS = float(os.environ.get("BROADCAST_IDLE_SECONDS", "1.0") or 1.0)
+BROADCAST_TOPIC_PREFIX = os.environ.get("BROADCAST_TOPIC_PREFIX", "atlas-detections:")
+BROADCAST_EVENT = os.environ.get("BROADCAST_EVENT", "tracks")
+
 # Inference priorities: lower value runs first when the model is contended.
 PRIORITY_FAST = 0
 PRIORITY_RANGE = 1
@@ -262,6 +282,7 @@ class Status:
         self.started_at = time.time()
         self.model = MODEL_PATH
         self.writer: dict = {}
+        self.broadcast: dict = {}
 
     def update(self, session_id: str, **fields) -> None:
         with self.lock:
@@ -297,6 +318,8 @@ class Status:
                 "engine": "yolo",
                 "model": self.model,
                 "db_writer": self.writer,
+                "transport": DETECTIONS_TRANSPORT,
+                "broadcast": self.broadcast,
                 "detection_fps": DETECTION_FPS,
                 "confidence": DETECTION_CONFIDENCE,
                 "classes": DETECTION_CLASSES,
@@ -493,6 +516,7 @@ class DetectionStore:
         self._lane_of: dict[str, dict] = {}
         self._next_lane = 0
         self._stats = self._empty_stats()
+        self.broadcaster = Broadcaster() if BROADCAST_ENABLED else None
         self._lanes = []
         for idx in range(max(1, DB_WRITER_THREADS)):
             lane = {
@@ -718,6 +742,396 @@ class DetectionStore:
                 }
             )
         return streams
+
+
+class RealtimeSocket:
+    """One persistent Supabase Realtime websocket shared by every stream.
+
+    Speaks the Phoenix channel protocol Realtime uses: join
+    `realtime:<topic>` as a private channel with the service-role key, push
+    `broadcast` events, heartbeat every 25 s. Channels are joined on first use
+    and left after a minute without snapshots. Broadcast acks are requested so
+    delivery is confirmed and its round trip measured, but never awaited by the
+    sender. While the socket is down `submit` returns False and the caller
+    falls back to the REST endpoint.
+    """
+
+    HEARTBEAT_SECONDS = 25.0
+    IDLE_LEAVE_SECONDS = 60.0
+
+    def __init__(self, broadcaster) -> None:
+        self._broadcaster = broadcaster
+        base = SUPABASE_URL.rstrip("/")
+        base = base.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+        self._url = f"{base}/realtime/v1/websocket?apikey={SUPABASE_SERVICE_ROLE_KEY}&vsn=1.0.0"
+        self._lock = threading.Lock()
+        self._pending: dict[str, dict] = {}
+        self._loop = asyncio.new_event_loop()
+        self._wake: asyncio.Event | None = None
+        self.connected = False
+        threading.Thread(target=self._thread, daemon=True, name="realtime-ws").start()
+
+    # -- called from worker threads ------------------------------------------ #
+
+    def submit(self, session_id: str, payload: dict) -> tuple[bool, bool]:
+        """Queue a snapshot. Returns (accepted, replaced_an_unsent_one)."""
+        if not self.connected or self._wake is None:
+            return False, False
+        with self._lock:
+            skipped = session_id in self._pending
+            self._pending[session_id] = payload
+        self._loop.call_soon_threadsafe(self._wake.set)
+        return True, skipped
+
+    # -- event loop ------------------------------------------------------------ #
+
+    def _thread(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_until_complete(self._run_forever())
+
+    async def _run_forever(self) -> None:
+        import websockets
+
+        self._wake = asyncio.Event()
+        backoff = BACKOFF_MIN
+        while True:
+            try:
+                async with websockets.connect(
+                    self._url, ping_interval=None, open_timeout=10, max_size=None
+                ) as ws:
+                    backoff = BACKOFF_MIN
+                    await self._session(ws)
+            except Exception as exc:
+                # The URL carries the service-role key: never let it reach a log.
+                reason = str(exc).replace(SUPABASE_SERVICE_ROLE_KEY, "***") if SUPABASE_SERVICE_ROLE_KEY else str(exc)
+                log.warning("Realtime websocket lost (%s); using REST until it is back", reason)
+            finally:
+                self.connected = False
+            await asyncio.sleep(backoff)
+            backoff = min(BACKOFF_MAX, backoff * 2)
+
+    async def _session(self, ws) -> None:
+        refs = iter(range(1, 1 << 62))
+        joined: dict[str, float] = {}           # topic -> last snapshot time
+        join_waiters: dict[str, asyncio.Future] = {}
+        sent_at: dict[str, float] = {}          # broadcast ref -> perf_counter
+
+        async def reader() -> None:
+            async for raw in ws:
+                msg = json.loads(raw)
+                event, ref, topic = msg.get("event"), msg.get("ref"), msg.get("topic")
+                if event == "phx_reply":
+                    ok = (msg.get("payload") or {}).get("status") == "ok"
+                    if ref in join_waiters:
+                        join_waiters.pop(ref).set_result(msg.get("payload"))
+                    elif ref in sent_at:
+                        ms = (time.perf_counter() - sent_at.pop(ref)) * 1000.0
+                        error = None if ok else f"broadcast rejected: {msg.get('payload')}"
+                        self._broadcaster.record("ws", ms, error)
+                elif event in ("phx_error", "phx_close") and topic in joined:
+                    joined.pop(topic, None)  # rejoin on next snapshot
+
+        async def heartbeat() -> None:
+            while True:
+                await asyncio.sleep(self.HEARTBEAT_SECONDS)
+                await ws.send(json.dumps(
+                    {"topic": "phoenix", "event": "heartbeat", "payload": {}, "ref": str(next(refs))}
+                ))
+
+        async def join(topic: str) -> None:
+            ref = str(next(refs))
+            waiter = asyncio.get_running_loop().create_future()
+            join_waiters[ref] = waiter
+            await ws.send(json.dumps({
+                "topic": topic, "event": "phx_join", "ref": ref, "join_ref": ref,
+                "payload": {
+                    "config": {
+                        "broadcast": {"ack": True, "self": False},
+                        "presence": {"key": ""},
+                        "private": True,
+                    },
+                    "access_token": SUPABASE_SERVICE_ROLE_KEY,
+                },
+            }))
+            reply = await asyncio.wait_for(waiter, timeout=10)
+            if (reply or {}).get("status") != "ok":
+                raise RuntimeError(f"join {topic} refused: {reply}")
+
+        tasks = [asyncio.ensure_future(reader()), asyncio.ensure_future(heartbeat())]
+        self.connected = True
+        log.info("Realtime websocket connected")
+        try:
+            while True:
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+                self._wake.clear()
+                for task in tasks:
+                    if task.done():
+                        raise task.exception() or ConnectionError("socket closed")
+                with self._lock:
+                    batch = list(self._pending.items())
+                    self._pending.clear()
+                now = time.time()
+                for session_id, payload in batch:
+                    topic = f"realtime:{Broadcaster.topic(session_id)}"
+                    if topic not in joined:
+                        await join(topic)
+                    joined[topic] = now
+                    ref = str(next(refs))
+                    sent_at[ref] = time.perf_counter()
+                    await ws.send(json.dumps({
+                        "topic": topic, "event": "broadcast", "ref": ref, "join_ref": ref,
+                        "payload": {"type": "broadcast", "event": BROADCAST_EVENT, "payload": payload},
+                    }))
+                # Housekeeping: leave idle channels, forget acks that never came.
+                for topic in [t for t, last in joined.items() if now - last > self.IDLE_LEAVE_SECONDS]:
+                    joined.pop(topic, None)
+                    await ws.send(json.dumps(
+                        {"topic": topic, "event": "phx_leave", "payload": {}, "ref": str(next(refs))}
+                    ))
+                stale = time.perf_counter() - 10.0
+                for ref in [r for r, t in sent_at.items() if t < stale]:
+                    sent_at.pop(ref, None)
+                    self._broadcaster.record("ws", None, "broadcast not acknowledged within 10 s")
+        finally:
+            self.connected = False
+            for task in tasks:
+                task.cancel()
+
+
+class Broadcaster:
+    """Pushes one Realtime Broadcast snapshot per frame to a private channel.
+
+    Postgres Changes turns every changed row into a Realtime message for every
+    viewer, after a database write, WAL decoding and an RLS check. A snapshot
+    is one message per frame no matter how many tracks it holds, and never
+    touches the database.
+
+    Primary path: one persistent Realtime websocket (RealtimeSocket), ~10 ms
+    per message from Fly. Fallback while the socket is down: the Realtime REST
+    endpoint (~110 ms per request), through one lane (own HTTP client) per
+    stream slot. Both use the service-role key, which may publish to private
+    channels; viewers are authorised by the RLS policy on realtime.messages.
+    Newest snapshot wins everywhere: a slow send is skipped, never queued.
+    """
+
+    def __init__(self) -> None:
+        import httpx
+
+        self._url = f"{SUPABASE_URL.rstrip('/')}/realtime/v1/api/broadcast"
+        self._headers = {
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "Content-Type": "application/json",
+        }
+        self._stats_lock = threading.Lock()
+        self._stats = self._empty_stats()
+        self._last_error: str | None = None
+        self._lane_of: dict[str, dict] = {}
+        self._next_lane = 0
+        self._lanes = []
+        for idx in range(max(1, DB_WRITER_THREADS)):
+            lane = {
+                "client": httpx.Client(timeout=5.0),
+                "pending": {},
+                "lock": threading.Lock(),
+                "event": threading.Event(),
+            }
+            self._lanes.append(lane)
+            threading.Thread(
+                target=self._sender_loop, args=(lane, idx == 0), daemon=True,
+                name=f"broadcast-{idx}",
+            ).start()
+        self._socket = RealtimeSocket(self)
+
+    @staticmethod
+    def topic(session_id: str) -> str:
+        return f"{BROADCAST_TOPIC_PREFIX}{session_id}"
+
+    def publish(self, session_id: str, tracks: list[dict]) -> None:
+        """Queue a snapshot (the complete track list) for one flight."""
+        payload = {
+            "v": 1,
+            "flight_session_id": session_id,
+            "sent_at": int(time.time() * 1000),
+            "tracks": tracks,
+        }
+        accepted, skipped = self._socket.submit(session_id, payload)
+        if not accepted:
+            lane = self._lane_for(session_id)
+            with lane["lock"]:
+                skipped = session_id in lane["pending"]
+                lane["pending"][session_id] = payload
+            lane["event"].set()
+        if skipped:
+            with self._stats_lock:
+                self._stats["skipped"] += 1
+
+    def _lane_for(self, key: str) -> dict:
+        with self._stats_lock:
+            lane = self._lane_of.get(key)
+            if lane is None:
+                lane = self._lanes[self._next_lane % len(self._lanes)]
+                self._next_lane += 1
+                self._lane_of[key] = lane
+            return lane
+
+    def record(self, via: str, ms: float | None = None, error: str | None = None) -> None:
+        """Account one sent message (ms = delivery round trip when known)."""
+        with self._stats_lock:
+            self._stats["sent_" + via] += 1
+            if ms is not None:
+                self._stats["timed"] += 1
+                self._stats["total_ms"] += ms
+                self._stats["max_ms"] = max(self._stats["max_ms"], ms)
+            if error:
+                self._stats["failed"] += 1
+                first = self._last_error is None
+                self._last_error = error
+        if error and first:
+            # Logged once; afterwards the count shows up in the summary line.
+            log.warning("Broadcast failed: %s (further failures are counted)", error)
+
+    def _sender_loop(self, lane: dict, reports: bool) -> None:
+        window_start = time.time()
+        while True:
+            lane["event"].wait(0.1)
+            lane["event"].clear()
+            with lane["lock"]:
+                payloads = list(lane["pending"].values())
+                lane["pending"].clear()
+            for payload in payloads:
+                self._send(lane["client"], payload)
+            if reports:
+                now = time.time()
+                if now - window_start >= LOG_SUMMARY_SECONDS:
+                    self._report(now - window_start)
+                    window_start = now
+
+    def _post(self, client, body: dict) -> int:
+        return client.post(self._url, headers=self._headers, json=body).status_code
+
+    def _send(self, client, payload: dict) -> None:
+        body = {
+            "messages": [
+                {
+                    "topic": self.topic(payload["flight_session_id"]),
+                    "event": BROADCAST_EVENT,
+                    "payload": payload,
+                    "private": True,
+                }
+            ]
+        }
+        started = time.perf_counter()
+        error = None
+        try:
+            code = self._post(client, body)
+            if code >= 300:
+                error = f"HTTP {code}"
+        except Exception as exc:  # never let a send error kill the loop
+            error = str(exc)
+        self.record("rest", (time.perf_counter() - started) * 1000.0, error)
+
+    def _report(self, window: float) -> None:
+        with self._stats_lock:
+            s = self._stats
+            self._stats = self._empty_stats()
+            last_error = self._last_error
+            if not s["failed"]:
+                self._last_error = None
+        sent = s["sent_ws"] + s["sent_rest"]
+        timed = s["timed"]
+        summary = {
+            "messages_per_second": round(sent / window, 1),
+            "via_websocket": s["sent_ws"],
+            "via_rest": s["sent_rest"],
+            "avg_ack_ms": round(s["total_ms"] / timed, 1) if timed else None,
+            "max_ack_ms": round(s["max_ms"], 1) if timed else None,
+            "skipped": s["skipped"],
+            "failed": s["failed"],
+            "last_error": last_error if s["failed"] else None,
+            "websocket_connected": self._socket.connected,
+        }
+        status.broadcast = summary
+        if sent or s["skipped"] or s["failed"]:
+            log.info(
+                "broadcast: %.1f msg/s (%d websocket, %d rest), ack avg %s ms, "
+                "max %s ms, %d skipped, %d failed%s",
+                summary["messages_per_second"],
+                s["sent_ws"],
+                s["sent_rest"],
+                summary["avg_ack_ms"],
+                summary["max_ack_ms"],
+                s["skipped"],
+                s["failed"],
+                f" ({last_error})" if s["failed"] else "",
+            )
+
+    @staticmethod
+    def _empty_stats() -> dict:
+        return {
+            "sent_ws": 0, "sent_rest": 0, "timed": 0, "total_ms": 0.0,
+            "max_ms": 0.0, "skipped": 0, "failed": 0,
+        }
+
+
+class VelocityEstimator:
+    """Smoothed per-track velocity in normalised units per second.
+
+    Sent with every snapshot so the frontend can glide boxes between
+    snapshots instead of letting them jump at 10 Hz.
+    """
+
+    def __init__(self, alpha: float = 0.5, max_gap: float = 1.0) -> None:
+        self._alpha = alpha
+        self._max_gap = max_gap
+        self._state: dict[int, tuple[float, float, float, float, float]] = {}
+
+    def update(self, track_id: int, cx: float, cy: float, now: float) -> tuple[float, float]:
+        prev = self._state.get(track_id)
+        vx = vy = 0.0
+        if prev is not None:
+            px, py, pt, pvx, pvy = prev
+            dt = now - pt
+            if 0.0 < dt <= self._max_gap:
+                a = self._alpha
+                vx = a * (cx - px) / dt + (1.0 - a) * pvx
+                vy = a * (cy - py) / dt + (1.0 - a) * pvy
+        self._state[track_id] = (cx, cy, now, vx, vy)
+        return vx, vy
+
+    def forget_older_than(self, now: float, seconds: float = 2.0) -> None:
+        for tid in [t for t, st in self._state.items() if now - st[2] > seconds]:
+            self._state.pop(tid, None)
+
+
+def snapshot_tracks(rows: list[dict], locked_ids, velocity: VelocityEstimator, now: float) -> list[dict]:
+    """atlas_detections rows -> the compact track list of a broadcast snapshot."""
+    tracks = []
+    for row in rows:
+        box = row["bbox"]
+        tid = int(row["track_id"])
+        vx, vy = velocity.update(
+            tid, box["x"] + box["width"] / 2.0, box["y"] + box["height"] / 2.0, now
+        )
+        tracks.append(
+            {
+                "id": tid,
+                "cls": row["object_class"],
+                "conf": row["confidence"],
+                "x": box["x"],
+                "y": box["y"],
+                "w": box["width"],
+                "h": box["height"],
+                "vx": round(vx, 4),
+                "vy": round(vy, 4),
+                "locked": tid in locked_ids,
+            }
+        )
+    velocity.forget_older_than(now)
+    return tracks
 
 
 # --------------------------------------------------------------------------- #
@@ -1567,6 +1981,7 @@ class StreamWorker(threading.Thread):
 
             # Drop stale boxes immediately so the UI never shows frozen overlays.
             self.store.clear(self.session_id)
+            self._broadcast_empty()
             reconnects += 1
             status.update(
                 self.session_id, connected=False, active_tracks=0, reconnects=reconnects
@@ -1576,8 +1991,14 @@ class StreamWorker(threading.Thread):
             backoff = min(BACKOFF_MAX, backoff * 2)
 
         self.store.clear(self.session_id)
+        self._broadcast_empty()
         status.remove(self.session_id)
         log.info("[%s] worker stopped", self.path)
+
+    def _broadcast_empty(self) -> None:
+        """Tell viewers right away that this stream has no boxes any more."""
+        if self.store.broadcaster is not None:
+            self.store.broadcaster.publish(self.session_id, [])
 
     def _run_once(self) -> None:
         cap = open_capture(self.url)
@@ -1607,6 +2028,10 @@ class StreamWorker(threading.Thread):
         last_seq = 0
         last_inference = 0.0
         stats = StreamStats()
+        velocity = VelocityEstimator()
+        broadcaster = self.store.broadcaster
+        last_broadcast = 0.0
+        last_broadcast_empty = False
 
         # Latest full-resolution frame, shared with the background scanners.
         full_frame_slot: dict = {"frame": None, "seq": -1}
@@ -1813,7 +2238,28 @@ class StreamWorker(threading.Thread):
                     )
 
                 status.update(self.session_id, active_tracks=len(rows))
-                self.store.upsert(rows)
+                if DETECTIONS_TRANSPORT == "broadcast":
+                    # Only locks live in the table now: the UI owns the flag and
+                    # the lock poll below reads it back from there.
+                    self.store.upsert(lock_rows)
+                else:
+                    self.store.upsert(rows)
+
+                if broadcaster is not None:
+                    # Throttled to BROADCAST_MAX_HZ; with nothing to show, only
+                    # a keep-alive empty snapshot every BROADCAST_IDLE_SECONDS.
+                    interval = (
+                        BROADCAST_IDLE_SECONDS
+                        if not rows and last_broadcast_empty
+                        else 1.0 / max(0.1, BROADCAST_MAX_HZ)
+                    )
+                    if now - last_broadcast >= interval:
+                        broadcaster.publish(
+                            self.session_id,
+                            snapshot_tracks(rows, set(lock_trackers), velocity, now),
+                        )
+                        last_broadcast = now
+                        last_broadcast_empty = not rows
 
                 stats.add(
                     frame_age_ms=(now - grabbed_at) * 1000.0,
