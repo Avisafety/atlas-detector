@@ -20,8 +20,19 @@ architecture and every environment variable.
 
 ## Fly.io
 
-`flyctl` is installed by the environment's setup script and authenticates with
-`FLY_API_TOKEN` (a deploy token scoped to this app).
+`flyctl` is installed by the environment's setup script. The cloud
+environment holds one deploy token per app, each scoped to that app only:
+
+| Variable | App |
+|---|---|
+| `FLY_TOKEN_ATLAS_DETECTOR` | `atlas-detector` |
+| `FLY_TOKEN_LIVE_VIDEO` | `live-video` (MediaMTX, repo Avisafety/live_video) |
+| `FLY_TOKEN_DJILOGPARSER` | `djilogparser` |
+
+flyctl only reads `FLY_API_TOKEN`, so pass the right one per command, e.g.
+`FLY_API_TOKEN="$FLY_TOKEN_ATLAS_DETECTOR" fly status -a atlas-detector`.
+Never print token values. Variables appear only in sessions started after
+they were saved (one per line, no hyphens in names).
 
 ```sh
 fly status -a atlas-detector                 # machines, version, health check
@@ -105,8 +116,8 @@ download.pytorch.org are blocked), so:
   wake path with
   `fly ssh console -a live-video -C "wget -T 20 -O - http://atlas-detector.flycast/wake"`.
   Deploying live-video interrupts all video briefly (publishers reconnect);
-  do it only with the owner's yes and preferably when nobody is flying. It
-  has its own deploy token in the environment.
+  do it only with the owner's yes and preferably when nobody is flying. Use
+  `FLY_TOKEN_LIVE_VIDEO` for it.
 - The Lovable project must never edit or deploy a copy of this detector; the
   detector is maintained only here.
 - Planned next: track-guided native-resolution crops for range, camera-motion
