@@ -156,6 +156,27 @@ RANGE_RESULT_MAX_AGE_SECONDS = float(
 # Temporary diagnostics: log per-source counts and every suppressed duplicate.
 RANGE_DEBUG = os.environ.get("RANGE_DEBUG", "false").lower() == "true"
 
+# --- Crop pass (track-guided, native resolution) ---------------------------- #
+# The range pass FINDS small, distant objects (every few seconds). The crop pass
+# KEEPS them: a few times per second, a small window is cut from the
+# full-resolution frame around every small track (where the tracker expects it)
+# and analysed 1:1, all windows in one batched inference. Without it a distant
+# object only the range pass can see lives for ~0.5 s after each range scan.
+CROP_PASS_ENABLED = os.environ.get("CROP_PASS_ENABLED", "true").lower() != "false"
+CROP_FPS = float(os.environ.get("CROP_FPS", "2") or 2)
+# Window side in full-resolution px, analysed at exactly this size (imgsz).
+CROP_SIZE = int(os.environ.get("CROP_SIZE", "320") or 320)
+MAX_CROPS = int(os.environ.get("MAX_CROPS", "4") or 4)
+# A track counts as small (gets a window) below this longest side, in px of the
+# fast-pass frame.
+SMALL_TRACK_MAX_SIDE = float(os.environ.get("SMALL_TRACK_MAX_SIDE", "48") or 48)
+CROP_CONFIDENCE = float(os.environ.get("CROP_CONFIDENCE", "0.15") or 0.15)
+CROP_RESULT_MAX_AGE_SECONDS = (1.0 / CROP_FPS if CROP_FPS > 0 else 1.0) + 0.3
+# The crop pass only runs while the model has room to spare: when a stream's
+# fast-pass frames wait longer than this for the model on average (several
+# streams sharing it), its crops pause until the wait is back under half.
+CROP_MAX_QUEUE_MS = float(os.environ.get("CROP_MAX_QUEUE_MS", "25") or 25)
+
 # --- Motion pass (third detection source) ---------------------------------- #
 # YOLO can only report an object it recognises. A distant object is often just
 # a few pixels of "something that moves differently than the ground" long
@@ -264,6 +285,8 @@ def class_group(label: str) -> str:
 # detector falls back to the PyTorch weights, so a bad export never takes the
 # service down.
 MODEL_PATH = os.environ.get("MODEL_PATH", "yolo26n.onnx")
+# Inference size for the fast and range passes (the model's native 640).
+DETECTOR_IMGSZ = 640
 FALLBACK_MODEL_PATH = os.environ.get("FALLBACK_MODEL_PATH", "yolo26n.pt")
 
 # Observability: one summary line per stream every LOG_SUMMARY_SECONDS instead
@@ -304,7 +327,8 @@ IDLE_EXIT_MINUTES = float(os.environ.get("IDLE_EXIT_MINUTES", "0") or 0)
 
 # Inference priorities: lower value runs first when the model is contended.
 PRIORITY_FAST = 0
-PRIORITY_RANGE = 1
+PRIORITY_CROP = 1
+PRIORITY_RANGE = 2
 
 # Backoff bounds for reconnecting to MediaMTX.
 BACKOFF_MIN = 1.0
@@ -553,6 +577,10 @@ class YoloDetector:
                 frame,
                 conf=conf if conf is not None else DETECTION_CONFIDENCE,
                 classes=sorted(self.class_ids.keys()),
+                # Always explicit: Ultralytics keeps the last call's imgsz, so
+                # a crop-pass call at 320 would otherwise shrink every later
+                # fast/range inference too.
+                imgsz=DETECTOR_IMGSZ,
                 verbose=False,
             )[0]
             finished = time.perf_counter()
@@ -561,6 +589,40 @@ class YoloDetector:
         if timing is not None:
             timing["wait_ms"] = (started - queued) * 1000.0
             timing["infer_ms"] = (finished - started) * 1000.0
+        return self._convert(result)
+
+    def detect_batch(
+        self,
+        images: list,
+        conf: float,
+        imgsz: int,
+        priority: int = PRIORITY_CROP,
+        timing: dict | None = None,
+    ) -> list[tuple[sv.Detections, list[str]]]:
+        """Several images in ONE inference (the ONNX export has a dynamic
+        batch dimension), each analysed at `imgsz`."""
+        if not images:
+            return []
+        queued = time.perf_counter()
+        self._lock.acquire(priority)
+        try:
+            started = time.perf_counter()
+            results = self.model.predict(
+                images,
+                conf=conf,
+                classes=sorted(self.class_ids.keys()),
+                imgsz=imgsz,
+                verbose=False,
+            )
+            finished = time.perf_counter()
+        finally:
+            self._lock.release()
+        if timing is not None:
+            timing["wait_ms"] = (started - queued) * 1000.0
+            timing["infer_ms"] = (finished - started) * 1000.0
+        return [self._convert(r) for r in results]
+
+    def _convert(self, result) -> tuple[sv.Detections, list[str]]:
         detections = sv.Detections.from_ultralytics(result)
         class_ids = (
             detections.class_id
@@ -1481,12 +1543,14 @@ def merge_source(detections, labels, extra, extra_labels, scale: float):
     return merged, list(labels) + list(extra_labels)
 
 
-def with_sources(detections, sources: list[str]):
+def with_sources(detections, sources: list[str], past: list[bool] | None = None):
     """Tag every box with where it came from (fast / range_new / range_old /
-    motion_new / motion_old); survives dedupe and filtering (sv.Detections
-    slices data arrays)."""
+    crop_new / crop_old / motion_new / motion_old) and whether it was computed
+    on an earlier frame; survives dedupe and filtering (sv.Detections slices
+    data arrays)."""
     detections.data = dict(detections.data or {})
     detections.data["src"] = np.array(sources, dtype=object)
+    detections.data["past"] = np.array(past if past is not None else [False] * len(sources), dtype=bool)
     return detections
 
 
@@ -1581,6 +1645,8 @@ class MotionScanner:
         self._lock = threading.Lock()
         self._detections: sv.Detections | None = None
         self._updated_at: float = 0.0
+        self._scan_seq = -1
+        self._result_seq = -1
         # Confirmation state: list of [cx, cy, w, h, hits] in analysis coords.
         self._candidates: list[list[float]] = []
         self._prev_gray = None
@@ -1596,16 +1662,17 @@ class MotionScanner:
     def stop(self) -> None:
         self._stop.set()
 
-    def latest(self) -> tuple[sv.Detections | None, float]:
+    def latest(self) -> tuple[sv.Detections | None, float, int]:
+        """(detections, finished at, seq of the frame they describe)."""
         with self._lock:
-            return self._detections, self._updated_at
+            return self._detections, self._updated_at, self._result_seq
 
     # -- internals ---------------------------------------------------------- #
 
     def _run(self) -> None:
         log.info("[%s] motion pass: %.1f analyses/s", self._path, MOTION_FPS)
         while not self._stop.is_set():
-            frame = self._frame_source()
+            frame, self._scan_seq = self._frame_source()
             if frame is None:
                 if self._stop.wait(0.2):
                     break
@@ -1637,7 +1704,7 @@ class MotionScanner:
         src = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
         dst = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
         matrix, inliers = cv2.estimateAffinePartial2D(
-            src, dst, method=cv2.RANSAC, ransacReprojThreshold=3.0
+            src, dst, method=cv2.RANSAC, ransacReprojThreshold=1.0
         )
         if matrix is None or inliers is None or int(inliers.sum()) < MOTION_MIN_INLIERS:
             return None
@@ -1722,6 +1789,7 @@ class MotionScanner:
         with self._lock:
             self._detections = detections
             self._updated_at = time.time()
+            self._result_seq = self._scan_seq
         if RANGE_DEBUG:
             log.info(
                 "[%s] motion: %d blob(s) -> %d confirmed",
@@ -1765,12 +1833,14 @@ class RangeScanner:
     def __init__(self, path: str, detector, frame_source) -> None:
         self._path = path
         self._detector = detector
-        self._frame_source = frame_source  # callable -> full-res frame or None
+        self._frame_source = frame_source  # callable -> (full-res frame or None, seq)
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._detections: sv.Detections | None = None
         self._labels: list[str] = []
         self._updated_at: float = 0.0
+        self._scan_seq = -1
+        self._result_seq = -1
         self.last_scan_ms: float = 0.0
         self._thread = threading.Thread(
             target=self._run, daemon=True, name=f"range-{path}"
@@ -1780,9 +1850,10 @@ class RangeScanner:
     def stop(self) -> None:
         self._stop.set()
 
-    def latest(self) -> tuple[sv.Detections | None, list[str], float]:
+    def latest(self) -> tuple[sv.Detections | None, list[str], float, int]:
+        """(detections, labels, finished at, seq of the frame they describe)."""
         with self._lock:
-            return self._detections, list(self._labels), self._updated_at
+            return self._detections, list(self._labels), self._updated_at, self._result_seq
 
     def _run(self) -> None:
         log.info(
@@ -1793,7 +1864,7 @@ class RangeScanner:
             RANGE_PASS_INTERVAL_SECONDS,
         )
         while not self._stop.is_set():
-            frame = self._frame_source()
+            frame, self._scan_seq = self._frame_source()
             if frame is None:
                 if self._stop.wait(0.2):
                     break
@@ -1881,11 +1952,140 @@ class RangeScanner:
             self._detections = merged
             self._labels = all_labels
             self._updated_at = time.time()
+            self._result_seq = self._scan_seq
         self.last_scan_ms = (time.perf_counter() - scan_started) * 1000.0
         if RANGE_DEBUG:
             log.info(
                 "[%s] range pass: %d object(s) in full frame", self._path, len(merged)
             )
+
+
+class CropScanner:
+    """Background thread that re-finds small tracks at native resolution.
+
+    `targets_source()` returns the full-resolution boxes of the current small
+    tracks (where the tracker expects them). A few times per second a
+    CROP_SIZE window is cut around each (nearby targets share a window, at
+    most MAX_CROPS), all windows go through the model in one batched call at
+    their own size, and the boxes come back in full-resolution coordinates.
+    """
+
+    def __init__(self, path: str, detector, frame_source, targets_source) -> None:
+        self._path = path
+        self._detector = detector
+        self._frame_source = frame_source
+        self._targets_source = targets_source
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._detections: sv.Detections | None = None
+        self._labels: list[str] = []
+        self._updated_at: float = 0.0
+        self._scan_seq = -1
+        self._result_seq = -1
+        self.last_scan_ms: float = 0.0
+        self.last_crops: int = 0
+        self._interval = 1.0 / CROP_FPS if CROP_FPS > 0 else 0.25
+        self._thread = threading.Thread(target=self._run, daemon=True, name=f"crop-{path}")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def latest(self) -> tuple[sv.Detections | None, list[str], float, int]:
+        """(detections, labels, finished at, seq of the frame they describe)."""
+        with self._lock:
+            return self._detections, list(self._labels), self._updated_at, self._result_seq
+
+    def _run(self) -> None:
+        log.info(
+            "[%s] crop pass: up to %d x %dpx windows %.0f/s around small tracks",
+            self._path, MAX_CROPS, CROP_SIZE, CROP_FPS,
+        )
+        while not self._stop.is_set():
+            started = time.time()
+            frame, self._scan_seq = self._frame_source()
+            targets = self._targets_source()
+            if frame is not None and targets is not None and len(targets):
+                try:
+                    self._scan(frame, targets)
+                except Exception as exc:
+                    log.warning("[%s] crop pass error: %s", self._path, exc)
+            else:
+                self.last_crops = 0
+            remaining = self._interval - (time.time() - started)
+            if self._stop.wait(max(0.02, remaining)):
+                break
+        log.info("[%s] crop pass stopped", self._path)
+
+    @staticmethod
+    def windows(targets: np.ndarray, width: int, height: int) -> list[tuple[int, int, int, int]]:
+        """CROP_SIZE windows covering the targets; a target whose centre sits
+        in the inner part of an earlier window shares it."""
+        side_w, side_h = min(CROP_SIZE, width), min(CROP_SIZE, height)
+        out: list[tuple[int, int, int, int]] = []
+        for x1, y1, x2, y2 in targets:
+            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            if any(
+                wx0 + side_w * 0.2 <= cx <= wx1 - side_w * 0.2
+                and wy0 + side_h * 0.2 <= cy <= wy1 - side_h * 0.2
+                for wx0, wy0, wx1, wy1 in out
+            ):
+                continue
+            x0 = int(min(max(0, cx - side_w / 2), width - side_w))
+            y0 = int(min(max(0, cy - side_h / 2), height - side_h))
+            out.append((x0, y0, x0 + side_w, y0 + side_h))
+            if len(out) >= MAX_CROPS:
+                break
+        return out
+
+    def _scan(self, frame, targets: np.ndarray) -> None:
+        started = time.perf_counter()
+        height, width = frame.shape[:2]
+        wins = self.windows(np.asarray(targets, dtype=float).reshape(-1, 4), width, height)
+        crops = [frame[y0:y1, x0:x1] for x0, y0, x1, y1 in wins]
+        results = self._detector.detect_batch(
+            crops, conf=CROP_CONFIDENCE, imgsz=CROP_SIZE, priority=PRIORITY_CROP
+        )
+        all_xyxy: list[np.ndarray] = []
+        all_conf: list[np.ndarray] = []
+        all_labels: list[str] = []
+        margin = 2.0
+        for (x0, y0, x1, y1), (dets, labels) in zip(wins, results):
+            if len(dets) == 0:
+                continue
+            conf = dets.confidence if dets.confidence is not None else np.zeros(len(dets))
+            keep = []
+            for i, (bx1, by1, bx2, by2) in enumerate(dets.xyxy):
+                # A box cut by a window edge that is not a frame edge is a
+                # fragment; the full object is (or will be) seen elsewhere.
+                cut = (
+                    (bx1 <= margin and x0 > 0)
+                    or (by1 <= margin and y0 > 0)
+                    or (bx2 >= (x1 - x0) - margin and x1 < width)
+                    or (by2 >= (y1 - y0) - margin and y1 < height)
+                )
+                if not cut:
+                    keep.append(i)
+            if not keep:
+                continue
+            boxes = dets.xyxy[keep].copy()
+            boxes[:, [0, 2]] += x0
+            boxes[:, [1, 3]] += y0
+            all_xyxy.append(boxes)
+            all_conf.append(conf[keep])
+            all_labels.extend(labels[i] for i in keep)
+        if all_xyxy:
+            merged = sv.Detections(xyxy=np.concatenate(all_xyxy), confidence=np.concatenate(all_conf))
+            merged, all_labels = dedupe_class_aware(merged, all_labels)
+        else:
+            merged, all_labels = sv.Detections.empty(), []
+        with self._lock:
+            self._detections = merged
+            self._labels = all_labels
+            self._updated_at = time.time()
+            self._result_seq = self._scan_seq
+        self.last_crops = len(wins)
+        self.last_scan_ms = (time.perf_counter() - started) * 1000.0
 
 
 # --------------------------------------------------------------------------- #
@@ -2059,6 +2259,21 @@ class MaskedFlowGMC:
     method = "maskedFlow"
     MIN_POINTS = 12
     MIN_INLIER_RATIO = 0.35
+    # Real camera motion moves the whole scene: the agreeing points must span
+    # at least this fraction of the frame in both directions. A large moving
+    # object (or a moving billboard) agrees with itself in one region only.
+    MIN_SPREAD = 0.45
+    # A drone camera does not zoom or roll more than this between two analysed
+    # frames; a larger fitted scale/rotation means a few moving points were
+    # folded into the model (static points near the origin, moving ones far
+    # away fit a small "zoom" plus shift).
+    MAX_SCALE_STEP = 0.02
+    MAX_ROTATION_STEP = 0.035  # radians, ~2 degrees
+    # When the fitted model moves the scene but a good share of the tracked
+    # points did not move at all, the camera is still and something large is
+    # moving (billboard, trailer, waves): apply no compensation.
+    STATIC_FLOW_PX = 0.25
+    STATIC_SHARE = 0.2
 
     # 640x360 fast frame -> 160x90: ~3 ms per frame worst case, mean error
     # ~0.1 px on a synthetic pan (2x/400 corners cost ~9-23 ms for 0.05 px).
@@ -2099,11 +2314,26 @@ class MaskedFlowGMC:
             good = status.reshape(-1) == 1
             if int(good.sum()) >= self.MIN_POINTS:
                 M, inliers = cv2.estimateAffinePartial2D(
-                    self._prev_pts[good], curr[good], method=cv2.RANSAC, ransacReprojThreshold=3.0
+                    self._prev_pts[good], curr[good], method=cv2.RANSAC, ransacReprojThreshold=1.0
                 )
+                accept = False
+                if M is not None and inliers is not None and inliers.any():
+                    pts = curr[good][inliers.reshape(-1) == 1].reshape(-1, 2)
+                    h1, w1 = gray.shape
+                    lo, hi = np.percentile(pts, [5, 95], axis=0)  # one stray point cannot fake a spread
+                    accept = hi[0] - lo[0] >= self.MIN_SPREAD * w1 and hi[1] - lo[1] >= self.MIN_SPREAD * h1
+                if accept:
+                    scale = float(np.hypot(M[0, 0], M[1, 0]))
+                    angle = float(np.arctan2(M[1, 0], M[0, 0]))
+                    accept = abs(scale - 1.0) <= self.MAX_SCALE_STEP and abs(angle) <= self.MAX_ROTATION_STEP
+                if accept:
+                    flow = (curr[good] - self._prev_pts[good]).reshape(-1, 2)
+                    static = int((np.abs(flow).max(axis=1) < self.STATIC_FLOW_PX).sum())
+                    moves = float(np.hypot(M[0, 2], M[1, 2])) > 1.0 or abs(scale - 1.0) > 0.005
+                    if moves and static >= max(4, self.STATIC_SHARE * int(good.sum())):
+                        accept = False
                 if (
-                    M is not None
-                    and inliers is not None
+                    accept
                     and int(inliers.sum()) >= max(self.MIN_POINTS, self.MIN_INLIER_RATIO * int(good.sum()))
                 ):
                     H = M.astype(np.float32)
@@ -2116,6 +2346,22 @@ class MaskedFlowGMC:
             mask=self._mask(gray.shape, detections),
         )
         return H
+
+
+class _FixedWarp:
+    """Stands in for BoT-SORT's GMC for one update and returns a camera
+    motion that was already measured (see StreamTracker.update)."""
+
+    method = "precomputed"
+
+    def __init__(self, warp: np.ndarray) -> None:
+        self.last_H = warp
+
+    def apply(self, raw_frame, detections=None) -> np.ndarray:
+        return self.last_H
+
+    def reset_params(self) -> None:
+        pass
 
 
 def _botsort_class():
@@ -2148,6 +2394,7 @@ class StreamTracker:
         self._votes: dict[int, dict] = {}
         self._label_ids: dict[str, int] = {}
         self._frame = 0
+        self._last_step = IDENTITY_WARP
         self.impl = TRACKER_IMPL if TRACKER_IMPL in ("botsort", "bytetrack") else "botsort"
         if self.impl == "bytetrack":
             # Previous behaviour, kept as a rollback (TRACKER_IMPL=bytetrack).
@@ -2220,9 +2467,32 @@ class StreamTracker:
             # Re-fed copies may only extend a track (low band), never open one.
             feed[stale] = np.minimum(feed[stale], max(TRACK_LOW_THRESH + 0.01, TRACK_HIGH_THRESH - 0.01))
         cls = [self._label_ids.setdefault(label, len(self._label_ids)) for label in labels]
-        out = self._bot.update(
-            _TrackerInput(detections.xyxy if n else np.zeros((0, 4)), feed, cls), frame
-        )
+        xyxy = np.asarray(detections.xyxy, dtype=np.float32) if n else np.zeros((0, 4), np.float32)
+        gmc = self._bot.gmc
+        if getattr(gmc, "method", None) is not None and frame is not None:
+            # Measure this frame's camera motion first (same input BoT-SORT
+            # would use), so boxes computed on an earlier frame (background
+            # passes, re-fed copies) can be moved into this frame before they
+            # are matched — BoT-SORT moves its tracks by the same step. Without
+            # it every re-fed box trails a panning camera by one frame, which
+            # is more than a small box is wide.
+            try:
+                step = gmc.apply(frame, xyxy[feed >= TRACK_HIGH_THRESH])
+            except Exception as exc:
+                log.warning("camera motion estimate failed: %s", exc)
+                step = IDENTITY_WARP
+            past = (detections.data or {}).get("past") if n else None
+            if past is not None and len(past) == n and np.any(past):
+                xyxy = xyxy.copy()
+                xyxy[past] = warp_boxes(xyxy[past], step)
+            self._last_step = step
+            self._bot.gmc = _FixedWarp(step)
+            try:
+                out = self._bot.update(_TrackerInput(xyxy, feed, cls), frame)
+            finally:
+                self._bot.gmc = gmc
+        else:
+            out = self._bot.update(_TrackerInput(xyxy, feed, cls), frame)
 
         if out is None or len(out) == 0:
             self._prune()
@@ -2239,11 +2509,25 @@ class StreamTracker:
         self._prune()
         return attach_labels(tracked, voted)
 
+    def small_targets(self, max_side: float, limit: int) -> np.ndarray:
+        """Boxes (tracker coordinates) of small tracks worth a native-resolution
+        look: confirmed tracks and ones lost only moments ago, freshest first."""
+        if self._bot is None:
+            return np.zeros((0, 4), dtype=np.float32)
+        tracks = [t for t in self._bot.tracked_stracks if t.is_activated]
+        tracks += list(self._bot.lost_stracks)
+        boxes = []
+        for t in sorted(tracks, key=lambda t: -t.frame_id):
+            x1, y1, x2, y2 = (float(v) for v in t.xyxy)
+            if max(x2 - x1, y2 - y1) <= max_side:
+                boxes.append((x1, y1, x2, y2))
+            if len(boxes) >= limit * 3:  # windows merge nearby targets
+                break
+        return np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
+
     def last_warp(self) -> np.ndarray:
         """Camera motion measured on the last update (identity if unknown)."""
-        gmc = getattr(self._bot, "gmc", None) if self._bot is not None else None
-        warp = getattr(gmc, "last_H", None)
-        return warp if warp is not None else IDENTITY_WARP
+        return self._last_step
 
     def _vote(self, track_id: int, label: str, confidence: float) -> str:
         entry = self._votes.get(track_id)
@@ -2295,7 +2579,13 @@ class StreamStats:
     def due(self) -> bool:
         return time.time() - self._started >= LOG_SUMMARY_SECONDS
 
-    def flush(self, range_scan_ms: float | None, locks: int) -> dict:
+    def flush(
+        self,
+        range_scan_ms: float | None,
+        locks: int,
+        crop_scan_ms: float | None = None,
+        crops: int = 0,
+    ) -> dict:
         now = time.time()
         n = max(1, self._count)
         metrics = {
@@ -2307,6 +2597,8 @@ class StreamStats:
             "max_loop_ms": round(self._max_loop, 1),
             "avg_tracks": round(self._sums["tracks"] / n, 1),
             "range_scan_ms": None if range_scan_ms is None else round(range_scan_ms),
+            "crop_scan_ms": None if crop_scan_ms is None else round(crop_scan_ms),
+            "crops": crops,
             "locks": locks,
             "window_seconds": round(now - self._started, 1),
         }
@@ -2383,6 +2675,12 @@ class StreamWorker(threading.Thread):
         range_fed_at = motion_fed_at = -1.0
         range_warp = motion_warp = IDENTITY_WARP
         range_new_left = motion_new_left = 0
+        crop_fed_at = -1.0
+        crop_warp = IDENTITY_WARP
+        crop_new_left = 0
+        crop_targets: dict = {"boxes": None}
+        crop_active = True
+        queue_ema = 0.0
         grabber = FrameGrabber(cap)
         last_seq = 0
         last_inference = 0.0
@@ -2397,11 +2695,25 @@ class StreamWorker(threading.Thread):
         broadcast_budget = 1.0
         budget_at = 0.0
 
-        # Latest full-resolution frame, shared with the background scanners.
-        full_frame_slot: dict = {"frame": None, "seq": -1}
+        # Latest full-resolution frame and its seq, shared with the background
+        # scanners (one tuple, so frame and seq always belong together).
+        full_frame_slot: dict = {"pair": (None, -1)}
 
         def latest_full_frame():
-            return full_frame_slot["frame"]
+            return full_frame_slot["pair"]
+
+        # Camera motion per analysed frame (seq, step), so a background result
+        # can be moved from the frame it was computed on to the current one —
+        # a range scan takes ~0.3 s, a crop scan ~0.05 s, and a panning camera
+        # moves the scene several px per frame meanwhile.
+        warp_log: collections.deque = collections.deque(maxlen=256)
+
+        def warp_since(result_seq: int) -> np.ndarray:
+            warp = IDENTITY_WARP
+            for step_seq, step in warp_log:
+                if step_seq > result_seq:
+                    warp = compose_warp(step, warp)
+            return warp
 
         scanner = (
             RangeScanner(self.path, self.detector, latest_full_frame)
@@ -2411,6 +2723,12 @@ class StreamWorker(threading.Thread):
         motion = (
             MotionScanner(self.path, latest_full_frame)
             if MOTION_PASS_ENABLED
+            else None
+        )
+        # Needs the BoT-SORT tracker (small_targets reads its track states).
+        cropper = (
+            CropScanner(self.path, self.detector, latest_full_frame, lambda: crop_targets["boxes"])
+            if CROP_PASS_ENABLED and tracker.impl == "botsort"
             else None
         )
 
@@ -2444,8 +2762,7 @@ class StreamWorker(threading.Thread):
 
                 # Share the full-resolution frame with the range scanner before
                 # downscaling — that is where the small/distant objects live.
-                full_frame_slot["frame"] = frame
-                full_frame_slot["seq"] = seq
+                full_frame_slot["pair"] = (frame, seq)
 
                 # Downscale before inference — boxes stay correct because they
                 # are normalised against the frame we actually analysed.
@@ -2471,8 +2788,11 @@ class StreamWorker(threading.Thread):
                 # where the object was, and feeding them spawns a ghost track.
                 range_count = 0
                 sources = ["fast"] * len(detections)
+                # True for boxes computed on an earlier frame: the tracker moves
+                # them by this frame's camera motion too (see StreamTracker).
+                past = [False] * len(detections)
                 if scanner is not None:
-                    range_dets, range_labels, range_at = scanner.latest()
+                    range_dets, range_labels, range_at, range_seq = scanner.latest()
                     fresh = (now - range_at) <= RANGE_RESULT_MAX_AGE_SECONDS
                     if range_dets is not None and len(range_dets) > 0 and fresh:
                         range_count = len(range_dets)
@@ -2483,7 +2803,7 @@ class StreamWorker(threading.Thread):
                             # the camera since then and may only keep an
                             # existing track alive (see StreamTracker).
                             if range_at != range_fed_at:
-                                range_fed_at, range_warp = range_at, IDENTITY_WARP
+                                range_fed_at, range_warp = range_at, warp_since(range_seq)
                                 range_new_left = NEW_RESULT_FRAMES
                             if range_new_left > 0:
                                 # New tracks need two consecutive frames to be
@@ -2498,6 +2818,7 @@ class StreamWorker(threading.Thread):
                         else:
                             range_src = "range_new"
                         sources += [range_src] * range_count
+                        past += [motion_compensated and range_seq != seq] * range_count
                         detections = sv.Detections(
                             xyxy=np.concatenate(
                                 [detections.xyxy, range_boxes]
@@ -2515,6 +2836,36 @@ class StreamWorker(threading.Thread):
                         )
                         labels = labels + list(range_labels)
 
+                # Crop pass: native-resolution looks at the small tracks. Same
+                # freshness rules as the range pass (new result may open tracks
+                # for NEW_RESULT_FRAMES frames, later copies follow the camera
+                # and only extend).
+                crop_count = 0
+                if cropper is not None:
+                    crop_dets, crop_labels, crop_at, crop_seq = cropper.latest()
+                    fresh = (now - crop_at) <= CROP_RESULT_MAX_AGE_SECONDS
+                    if crop_dets is not None and len(crop_dets) > 0 and fresh:
+                        crop_count = len(crop_dets)
+                        if crop_at != crop_fed_at:
+                            crop_fed_at, crop_warp = crop_at, warp_since(crop_seq)
+                            crop_new_left = NEW_RESULT_FRAMES
+                        if crop_new_left > 0:
+                            crop_new_left -= 1
+                            crop_src = "crop_new"
+                        else:
+                            crop_src = "crop_old"
+                        crop_view = crop_dets
+                        if crop_warp is not IDENTITY_WARP:
+                            crop_view = sv.Detections(
+                                xyxy=warp_boxes(crop_dets.xyxy * scale, crop_warp) / scale,
+                                confidence=crop_dets.confidence,
+                            )
+                        sources += [crop_src] * crop_count
+                        past += [crop_seq != seq] * crop_count
+                        detections, labels = merge_source(
+                            detections, labels, crop_view, crop_labels, scale
+                        )
+
                 # Motion candidates: objects that move against the compensated
                 # background but are not classifiable yet. Same coordinate
                 # conversion, same dedupe, same tracker — a motion box that
@@ -2522,14 +2873,14 @@ class StreamWorker(threading.Thread):
                 # object never gets two boxes.
                 motion_count = 0
                 if motion is not None:
-                    motion_dets, motion_at = motion.latest()
+                    motion_dets, motion_at, motion_seq = motion.latest()
                     fresh = (now - motion_at) <= MOTION_RESULT_MAX_AGE_SECONDS
                     if motion_dets is not None and len(motion_dets) > 0 and fresh:
                         motion_count = len(motion_dets)
                         motion_src = "motion_new"
                         if motion_compensated:
                             if motion_at != motion_fed_at:
-                                motion_fed_at, motion_warp = motion_at, IDENTITY_WARP
+                                motion_fed_at, motion_warp = motion_at, warp_since(motion_seq)
                                 motion_new_left = NEW_RESULT_FRAMES
                             if motion_new_left > 0:
                                 motion_new_left -= 1
@@ -2541,6 +2892,7 @@ class StreamWorker(threading.Thread):
                                     confidence=motion_dets.confidence,
                                 )
                         sources += [motion_src] * motion_count
+                        past += [motion_compensated and motion_seq != seq] * motion_count
                         detections, labels = merge_source(
                             detections,
                             labels,
@@ -2550,7 +2902,7 @@ class StreamWorker(threading.Thread):
                         )
 
                 merged_count = len(detections)
-                detections = with_sources(detections, sources)
+                detections = with_sources(detections, sources, past)
                 detections, labels = dedupe_class_aware(detections, labels)
 
                 # ---- Locked objects ---------------------------------------- #
@@ -2626,8 +2978,27 @@ class StreamWorker(threading.Thread):
                 detections = tracker.update(detections, labels, frame)
                 if motion_compensated:
                     step = tracker.last_warp()
+                    warp_log.append((seq, step))
                     range_warp = compose_warp(step, range_warp)
                     motion_warp = compose_warp(step, motion_warp)
+                    crop_warp = compose_warp(step, crop_warp)
+                if cropper is not None:
+                    # Pause the crop pass while the model is contended (the
+                    # fast pass of every stream comes first), with hysteresis.
+                    queue_ema += 0.1 * (timing.get("wait_ms", 0.0) - queue_ema)
+                    if crop_active and queue_ema > CROP_MAX_QUEUE_MS:
+                        crop_active = False
+                        log.info("[%s] crop pass paused (model queue %.0f ms)", self.path, queue_ema)
+                    elif not crop_active and queue_ema < CROP_MAX_QUEUE_MS / 2:
+                        crop_active = True
+                        log.info("[%s] crop pass resumed (model queue %.0f ms)", self.path, queue_ema)
+                    # Where the small tracks are now, in full-resolution px,
+                    # for the crop pass's next round.
+                    crop_targets["boxes"] = (
+                        tracker.small_targets(SMALL_TRACK_MAX_SIDE, MAX_CROPS) / scale
+                        if crop_active
+                        else None
+                    )
                 rows = build_rows(detections, self.session_id, width, height)
                 rows = [r for r in rows if r["track_id"] not in lock_trackers]
                 rows.extend(lock_rows)
@@ -2680,13 +3051,15 @@ class StreamWorker(threading.Thread):
                 if stats.due():
                     metrics = stats.flush(
                         range_scan_ms=scanner.last_scan_ms if scanner else None,
+                        crop_scan_ms=cropper.last_scan_ms if cropper else None,
+                        crops=cropper.last_crops if cropper else 0,
                         locks=len(lock_trackers),
                     )
                     status.update(self.session_id, metrics=metrics)
                     log.info(
                         "[%s] %.1f fps | infer %.0f ms (+%.0f ms queue) | "
                         "frame age %.0f ms | loop %.0f ms (max %.0f) | "
-                        "%.1f tracks | range scan %s ms | %d lock(s)",
+                        "%.1f tracks | range scan %s ms | crops %d (%s ms) | %d lock(s)",
                         self.path,
                         metrics["fps"],
                         metrics["avg_infer_ms"],
@@ -2696,6 +3069,8 @@ class StreamWorker(threading.Thread):
                         metrics["max_loop_ms"],
                         metrics["avg_tracks"],
                         metrics["range_scan_ms"],
+                        metrics["crops"],
+                        metrics["crop_scan_ms"],
                         metrics["locks"],
                     )
 
@@ -2731,6 +3106,8 @@ class StreamWorker(threading.Thread):
         finally:
             if scanner is not None:
                 scanner.stop()
+            if cropper is not None:
+                cropper.stop()
             if motion is not None:
                 motion.stop()
             grabber.stop()

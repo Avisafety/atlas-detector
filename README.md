@@ -60,10 +60,18 @@ endpoint (~110 ms). Viewers are authorised by the RLS policy on
 `TRACKER_IMPL=botsort` (default) runs Ultralytics BoT-SORT with our own
 background-only motion compensation (`MaskedFlowGMC`): sparse optical flow on
 the fast frame downscaled to 160×90, with every detected box masked out, so a
-large moving object cannot pose as camera motion. When too few background
-points agree (open sea, fog) no compensation is applied rather than a wrong
-one. Tracks are moved with the camera before matching, so a gimbal pan no
-longer breaks them into new ids.
+large moving object cannot pose as camera motion. The estimate is only used
+when the agreeing points cover most of the frame (a large undetected mover —
+a trailer, a billboard, waves — agrees with itself in one region only), the
+fitted zoom/roll per frame is small, and the scene has not simply stood still
+while one region moved. Otherwise no compensation is applied rather than a
+wrong one (open sea, fog, fast zoom). Tracks are moved with the camera before
+matching, so a gimbal pan no longer breaks them into new ids.
+
+Boxes computed on an earlier frame (range, crop and motion results, and their
+re-fed copies) are moved by all camera motion since the frame they were
+computed on — including the current frame's, which is measured before
+matching — so they land where the object is now, not where it was.
 
 - Detections ≥ `TRACK_HIGH_THRESH` (0.25) start and extend tracks; those
   between `TRACK_LOW_THRESH` (0.10) and HIGH only extend existing tracks.
@@ -79,9 +87,12 @@ longer breaks them into new ids.
 
 Measured with `tools/smoke_test.py` (two people + a small distant bus): static
 camera 23 → 2 person ids, panning camera (`H_PAN=1`) 35 → 2, each id lasting
-the whole run; motion compensation costs ~3 ms per frame.
+the whole run; motion compensation costs ~3 ms per frame. With the crop pass
+(same test, 2 cores): the three small people beside the distant bus keep one
+id each for the whole run with a panning camera (v61: ids lasting 3–7
+frames); one stream drops from ~19 to ~16 fps.
 
-## Two cooperating passes, one tracker
+## Three cooperating passes, one tracker
 
 - **Fast pass** — the whole frame downscaled to `INFER_MAX_SIDE` (default 640),
   analysed `DETECTION_FPS` times per second. This drives box responsiveness.
@@ -89,8 +100,17 @@ the whole run; motion compensation costs ~3 ms per frame.
   `RANGE_TILE_COLS` × `RANGE_TILE_ROWS` grid with `RANGE_TILE_OVERLAP`,
   analysed every `RANGE_PASS_INTERVAL_SECONDS` (default 2 s) at
   `RANGE_CONFIDENCE`. Catches small, distant objects the downscale loses.
+- **Crop pass** — keeps them. `CROP_FPS` times per second a `CROP_SIZE`
+  (320 px) window is cut from the full-resolution frame around every small
+  track (longest side ≤ `SMALL_TRACK_MAX_SIDE` in the fast frame, confirmed or
+  just lost; nearby tracks share a window, at most `MAX_CROPS`) and all
+  windows go through the model in one batched call at their own size. Without
+  it an object only the range pass can see lives for ~0.5 s after each scan.
+  The crop pass pauses by itself while the model is contended (a stream's
+  fast-pass frames wait more than `CROP_MAX_QUEUE_MS` on average — several
+  streams on one machine), so it never costs the fast pass frame rate there.
 
-Range boxes are mapped to full-frame coordinates and merged with the fast-pass
+Range and crop boxes are mapped to full-frame coordinates and merged with the fast-pass
 boxes into **one** detection list, which is deduped in a single class-aware
 pass before it reaches the single ByteTrack instance — one object is always one
 box. Suppression uses IoU (`RANGE_DEDUPE_IOU`) **and** containment
@@ -164,6 +184,13 @@ fly secrets set \
 | `TRACKER_GMC` | `maskedFlow` | `maskedFlow`, Ultralytics `sparseOptFlow` / `orb` / `ecc`, or `none` |
 | `TRACK_HIGH_THRESH` / `TRACK_LOW_THRESH` / `NEW_TRACK_THRESH` | `0.25` / `0.10` / `0.25` | See "Tracking with a moving camera" |
 | `RANGE_NEW_TRACK_MAX_SIDE` | `64` | Largest range box (px, fast frame) allowed to open a track |
+| `CROP_PASS_ENABLED` | `true` | Crop pass on/off (needs `TRACKER_IMPL=botsort`) |
+| `CROP_FPS` | `2` | Crop rounds per second per stream |
+| `CROP_SIZE` | `320` | Crop window side, full-resolution px (analysed 1:1) |
+| `MAX_CROPS` | `4` | Windows per round |
+| `SMALL_TRACK_MAX_SIDE` | `48` | Tracks up to this longest side (px, fast frame) get a window |
+| `CROP_CONFIDENCE` | `0.15` | Crop-pass minimum score |
+| `CROP_MAX_QUEUE_MS` | `25` | Pause the crop pass above this average model wait (resumes below half) |
 | `CLASS_VOTE_WINDOW` | `10` | Detections per track used for the class vote |
 | `LOCK_REINIT_IOU` | `0.6` | Re-anchor a lock's pixel tracker only below this IoU with its detection |
 | `IDLE_EXIT_MINUTES` | `0` (fly.toml: `10`) | Exit after this long without an analysed frame so the Fly machine sleeps; `0` = never |

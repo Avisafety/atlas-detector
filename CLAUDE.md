@@ -32,12 +32,14 @@ environment holds one deploy token per app, each scoped to that app only:
 
 | Variable | App |
 |---|---|
-| `FLY_TOKEN_ATLAS_DETECTOR` | `atlas-detector` |
-| `FLY_TOKEN_LIVE_VIDEO` | `live-video` (MediaMTX, repo Avisafety/live_video) |
-| `FLY_TOKEN_DJILOGPARSER` | `djilogparser` |
+| `claude_access` | `atlas-detector` |
+| `claude_access_live_video` | `live-video` (MediaMTX, repo Avisafety/live_video) |
+| `claude_access_djilogparser` | `djilogparser` |
 
 flyctl only reads `FLY_API_TOKEN`, so pass the right one per command, e.g.
-`FLY_API_TOKEN="$FLY_TOKEN_ATLAS_DETECTOR" fly status -a atlas-detector`.
+`FLY_API_TOKEN="$TOK" fly status -a atlas-detector`. The saved values are
+wrapped in « » quotes and may lack the space after FlyV1, so normalise first:
+`TOK=$(python3 -c "import os;v=os.environ['claude_access'].strip().strip('«»\"\' ');v=v[5:].lstrip() if v.startswith('FlyV1') else v;print('FlyV1 '+v)")`.
 Never print token values. Variables appear only in sessions started after
 they were saved (one per line, no hyphens in names).
 
@@ -132,7 +134,7 @@ download.pytorch.org are blocked), so:
   `fly ssh console -a live-video -C "wget -T 20 -O - http://atlas-detector.flycast/wake"`.
   Deploying live-video interrupts all video briefly (publishers reconnect);
   do it only with the owner's yes and preferably when nobody is flying. Use
-  `FLY_TOKEN_LIVE_VIDEO` for it.
+  `claude_access_live_video` for it.
 - The Lovable project must never edit or deploy a copy of this detector; the
   detector is maintained only here.
 - Tracker: BoT-SORT + MaskedFlowGMC (README "Tracking with a moving camera").
@@ -142,9 +144,15 @@ download.pytorch.org are blocked), so:
   workflow) with DETECTION_CONFIDENCE=0.2 (secret, was 0.35).
 - Fly tokens are "FlyV1 fm2_..." — the space after FlyV1 is part of the
   token; without it Fly answers Unauthorized.
-- Known: distant objects seen only by the range pass (every 4 s) still get
-  short tracks between scans — round 3 (track-guided native-resolution
-  crops) fixes that. Lock labels come from the last matching detection and
-  can flip (no voting for locks yet).
-- Planned next: round 3 range crops; later a lease table so several machines
-  can share many streams; custom training on own footage (not now).
+- Crop pass (round 3): native-resolution windows around small tracks,
+  `CROP_FPS=2`, pauses itself when the model queue exceeds
+  `CROP_MAX_QUEUE_MS` (several streams). Background results carry the seq of
+  the frame they were computed on and are warped to the current frame
+  (warp_log in the worker + this frame's step in StreamTracker). Check with
+  `H_PAN=1 H_IDS_DETAIL=1` (small people keep one id) and `H_STREAMS=3`
+  (log shows "crop pass paused"; fps close to the previous app.py).
+  `CROP_PASS_ENABLED=false` is the rollback. Lock labels come from the last
+  matching detection and can flip (no voting for locks yet).
+- Planned next: a lease table so several machines can share many streams;
+  faster ORT threading for multi-stream; custom training on own footage
+  (not now).
