@@ -44,7 +44,7 @@ primary_region = "ams"
 [env]
   # Stream discovery — no per-drone configuration needed.
   RTSP_BASE_URL = "rtsp://live-video.internal:8554"
-  MAX_STREAMS = "2"
+  MAX_STREAMS = "3"
   DISCOVERY_INTERVAL_SECONDS = "10"
   SENSOR_STALE_SECONDS = "300"
 

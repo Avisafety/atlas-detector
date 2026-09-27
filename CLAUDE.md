@@ -153,6 +153,11 @@ download.pytorch.org are blocked), so:
   (log shows "crop pass paused"; fps close to the previous app.py).
   `CROP_PASS_ENABLED=false` is the rollback. Lock labels come from the last
   matching detection and can flip (no voting for locks yet).
+- MAX_STREAMS=3 (fly.toml, since v64). Discovery counts a flight as live when
+  its drone has registered a sensor, not when video arrives; a worker with no
+  video for SLOT_RELEASE_SECONDS gives its slot to a waiting flight (log: "no
+  video for … giving its slot"). Check with
+  `H_DEAD_FIRST=2 H_STREAMS=2 H_MAX_STREAMS=3 SLOT_RELEASE_SECONDS=10`.
 - Planned next: a lease table so several machines can share many streams;
   faster ORT threading for multi-stream; custom training on own footage
   (not now).

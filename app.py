@@ -100,6 +100,12 @@ RTSP_URL = os.environ.get("MEDIAMTX_RTSP_URL", "").strip()
 FLIGHT_SESSION_ID = os.environ.get("FLIGHT_SESSION_ID", "").strip()
 
 MAX_STREAMS = int(os.environ.get("MAX_STREAMS", "2") or 2)
+# A flight counts as live when its drone has registered a sensor, not when
+# video actually arrives. When every slot is taken and another flight waits,
+# a worker that has had no video for SLOT_RELEASE_SECONDS gives up its slot and
+# its flight waits STREAM_RETRY_SECONDS before it may take one again.
+SLOT_RELEASE_SECONDS = float(os.environ.get("SLOT_RELEASE_SECONDS", "30") or 30)
+STREAM_RETRY_SECONDS = float(os.environ.get("STREAM_RETRY_SECONDS", "60") or 60)
 DISCOVERY_INTERVAL_SECONDS = float(
     os.environ.get("DISCOVERY_INTERVAL_SECONDS", "10") or 10
 )
@@ -2619,6 +2625,12 @@ class StreamWorker(threading.Thread):
         self.store = store
         self.url = RTSP_URL if RTSP_URL else rtsp_url_for(path)
         self._stop_event = threading.Event()  # not `_stop`: Thread uses that name internally (join)
+        self.started_at = time.time()
+        self.last_frame_at: float | None = None
+
+    def seconds_without_video(self) -> float:
+        """Since the last analysed frame (or since start, if none yet)."""
+        return time.time() - (self.last_frame_at or self.started_at)
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -2754,6 +2766,7 @@ class StreamWorker(threading.Thread):
                 now = time.time()
                 last_seq = seq
                 last_inference = now
+                self.last_frame_at = now
                 status.update(self.session_id, last_frame_at=now)
 
                 src_h, src_w = frame.shape[:2]
@@ -3148,24 +3161,54 @@ def supervise(detector, store: DetectionStore) -> None:
         while True:
             time.sleep(DISCOVERY_INTERVAL_SECONDS)
 
+    retry_after: dict[str, float] = {}  # session -> time it may take a slot again
+    released: dict[str, StreamWorker] = {}  # stopped for a waiting flight, maybe still exiting
     while True:
         streams = store.live_streams()
         wanted = {s["flight_session_id"]: s["path"] for s in streams}
+        now = time.time()
 
         for session_id, worker in list(workers.items()):
             if session_id not in wanted or not worker.is_alive():
                 log.info("Stopping worker for %s", session_id)
                 worker.stop()
                 workers.pop(session_id, None)
+        retry_after = {k: t for k, t in retry_after.items() if k in wanted and t > now}
+        released = {k: w for k, w in released.items() if w.is_alive()}
 
-        for session_id, path in wanted.items():
-            if session_id in workers:
-                continue
+        # Flights waiting for a slot; ones that just gave a slot up go last.
+        waiting = sorted(
+            (sid for sid in wanted if sid not in workers),
+            key=lambda sid: retry_after.get(sid, 0.0),
+        )
+        if len(workers) >= MAX_STREAMS and any(sid not in retry_after for sid in waiting):
+            for session_id, worker in list(workers.items()):
+                idle = worker.seconds_without_video()
+                if idle >= SLOT_RELEASE_SECONDS:
+                    log.info(
+                        "[%s] no video for %.0f s — giving its slot to a waiting flight",
+                        worker.path,
+                        idle,
+                    )
+                    worker.stop()
+                    workers.pop(session_id, None)
+                    released[session_id] = worker
+                    retry_after[session_id] = now + STREAM_RETRY_SECONDS
+                    waiting.append(session_id)
+
+        for session_id in waiting:
+            if session_id in workers or session_id in released:
+                continue  # running, or its previous worker is still shutting down
+            path = wanted[session_id]
             if len(workers) >= MAX_STREAMS:
                 log.warning(
                     "MAX_STREAMS=%d reached — not analysing %s", MAX_STREAMS, path
                 )
                 break
+            if retry_after.get(session_id, 0.0) > now and any(
+                sid not in retry_after and sid not in workers for sid in waiting
+            ):
+                continue  # a flight that has not failed yet goes first
             worker = StreamWorker(session_id, path, detector, store)
             workers[session_id] = worker
             worker.start()

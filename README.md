@@ -157,7 +157,9 @@ fly secrets set \
 | `RTSP_BASE_URL` | `rtsp://live-video.internal:8554` | Stream base (path = `<serial>/<sensor>`) |
 | `MEDIAMTX_RTSP_URL` | – | Optional: pin one stream (manual testing) |
 | `FLIGHT_SESSION_ID` | – | Required together with `MEDIAMTX_RTSP_URL` |
-| `MAX_STREAMS` | `2` | Simultaneous streams analysed |
+| `MAX_STREAMS` | `2` | Simultaneous streams analysed (fly.toml: `3`) |
+| `SLOT_RELEASE_SECONDS` | `30` | With all slots taken and a flight waiting, a worker without video this long gives its slot up |
+| `STREAM_RETRY_SECONDS` | `60` | How long a flight that gave its slot up waits behind the others |
 | `DISCOVERY_INTERVAL_SECONDS` | `10` | How often live streams are (re)discovered |
 | `SENSOR_STALE_SECONDS` | `300` | A sensor counts as live for this long |
 | `DETECTION_FPS` | `10` | Fast-pass frames analysed per second |

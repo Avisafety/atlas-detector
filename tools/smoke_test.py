@@ -8,6 +8,8 @@ been written plus the /health metrics.
     python tools/smoke_test.py app.py 45                  # one pinned stream
     H_STREAMS=3 python tools/smoke_test.py app.py 45      # three discovered streams
     H_LOCK=1 python tools/smoke_test.py app.py 35         # a manual lock (track -1)
+    H_DEAD_FIRST=2 H_STREAMS=2 H_MAX_STREAMS=3 SLOT_RELEASE_SECONDS=10 \
+        python tools/smoke_test.py app.py 60              # flights without video free their slots
     MODEL_PATH=missing.onnx python tools/smoke_test.py app.py 25   # fallback to .pt
 
 Pin it to the target's core count (`taskset -c 0,1 ...` for performance-2x)
@@ -171,9 +173,17 @@ if os.environ.get('H_NO_STREAMS') == '1' or os.environ.get('H_DEAD_STREAM') == '
         app.open_capture = lambda url: None
     else:
         app.DetectionStore.live_streams = lambda self: []
-if N > 1:
-    os.environ.pop('MEDIAMTX_RTSP_URL'); app.RTSP_URL = ''; app.MAX_STREAMS = N
-    app.DetectionStore.live_streams = lambda self: [{'flight_session_id': f's{i}', 'path': f'drone{i}/1'} for i in range(N)]
+# H_DEAD_FIRST=K (with H_STREAMS=N): K extra active flights whose drones send no
+# video are listed first; with H_MAX_STREAMS slots the N live streams must still
+# get analysed once the dead ones give their slots up (SLOT_RELEASE_SECONDS).
+DEAD_FIRST = int(os.environ.get('H_DEAD_FIRST', '0') or 0)
+if N > 1 or DEAD_FIRST:
+    os.environ.pop('MEDIAMTX_RTSP_URL', None); app.RTSP_URL = ''
+    app.MAX_STREAMS = int(os.environ.get('H_MAX_STREAMS', N) or N)
+    app.DetectionStore.live_streams = lambda self: (
+        [{'flight_session_id': f'dead{i}', 'path': f'dead{i}/1'} for i in range(DEAD_FIRST)]
+        + [{'flight_session_id': f's{i}', 'path': f'drone{i}/1'} for i in range(N)])
+    app.open_capture = lambda url: None if '/dead' in url else FakeCap()
 main_thread = threading.Thread(target=app.main, daemon=True)
 main_thread.start()
 t0 = time.time()
