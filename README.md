@@ -134,11 +134,28 @@ fly secrets set \
 | `LOG_SUMMARY_SECONDS` | `10` | Interval of the per-stream summary log line and `/health` metrics |
 | `LOG_EVERY_FRAME` | `false` | Also log one line per analysed frame (very verbose) |
 | `DB_WRITER_THREADS` | `MAX_STREAMS` | Parallel Supabase writers (one per stream slot) |
+| `IDLE_EXIT_MINUTES` | `0` (fly.toml: `10`) | Exit after this long without an analysed frame so the Fly machine sleeps; `0` = never |
 | `DETECTIONS_TRANSPORT` | `both` | `postgres`, `broadcast` or `both` (see above) |
 | `BROADCAST_MAX_HZ` | `10` | Broadcast snapshots per second per stream |
 | `BROADCAST_IDLE_SECONDS` | `1.0` | Keep-alive interval for empty snapshots |
 | `BROADCAST_TOPIC_PREFIX` | `atlas-detections:` | Channel name prefix (+ flight_session_id) |
 | `BROADCAST_EVENT` | `tracks` | Broadcast event name |
+
+## Sleeping and waking (scale to zero)
+
+With `IDLE_EXIT_MINUTES` set, the detector exits cleanly after that many
+minutes without a single analysed frame, and Fly stops the machine (restart
+policy `on-failure`; `min_machines_running = 0`). An active flight whose stream
+is gone does not keep it awake — only real video (or a wake request) does.
+
+It is woken by `GET /wake` on its private Flycast address
+(`http://atlas-detector.flycast/wake`): Fly's proxy starts the stopped machine
+to deliver the request, and the detector runs discovery immediately. MediaMTX
+(`live-video`) sends that request from its `runOnReady` hook (a drone started
+publishing) and `runOnRead` hook (someone started watching). The Flycast IP is
+allocated once with `fly ips allocate-v6 --private -a atlas-detector`. The
+proxy never stops the machine itself (`auto_stop_machines = "off"`), because
+the detector receives no inbound traffic while it works.
 
 ## Health
 

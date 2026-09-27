@@ -256,6 +256,15 @@ BROADCAST_IDLE_SECONDS = float(os.environ.get("BROADCAST_IDLE_SECONDS", "1.0") o
 BROADCAST_TOPIC_PREFIX = os.environ.get("BROADCAST_TOPIC_PREFIX", "atlas-detections:")
 BROADCAST_EVENT = os.environ.get("BROADCAST_EVENT", "tracks")
 
+# Scale to zero. After this many minutes without a single analysed frame the
+# process exits cleanly and Fly stops the machine (restart policy on-failure).
+# MediaMTX wakes it again with a request to GET /wake on the app's private
+# Flycast address when a drone starts publishing or a viewer starts watching;
+# Fly starts the stopped machine on that request. "Active flight" alone does
+# not count: a flight whose stream is gone (RTSP 404) must not keep it awake.
+# 0 = never sleep.
+IDLE_EXIT_MINUTES = float(os.environ.get("IDLE_EXIT_MINUTES", "0") or 0)
+
 # Inference priorities: lower value runs first when the model is contended.
 PRIORITY_FAST = 0
 PRIORITY_RANGE = 1
@@ -282,12 +291,25 @@ class Status:
         self.started_at = time.time()
         self.model = MODEL_PATH
         self.writer: dict = {}
+        # Latest moment anyone needed the detector: an analysed frame or a
+        # /wake request. Drives IDLE_EXIT_MINUTES.
+        self.last_activity = self.started_at
         self.broadcast: dict = {}
 
     def update(self, session_id: str, **fields) -> None:
         with self.lock:
             entry = self.streams.setdefault(session_id, {})
             entry.update(fields)
+            if "last_frame_at" in fields:
+                self.last_activity = max(self.last_activity, fields["last_frame_at"])
+
+    def touch(self) -> None:
+        with self.lock:
+            self.last_activity = time.time()
+
+    def idle_seconds(self) -> float:
+        with self.lock:
+            return time.time() - self.last_activity
 
     def remove(self, session_id: str) -> None:
         with self.lock:
@@ -325,6 +347,8 @@ class Status:
                 "classes": DETECTION_CLASSES,
                 "max_streams": MAX_STREAMS,
                 "active_streams": len(streams),
+                "idle_seconds": round(time.time() - self.last_activity, 1),
+                "idle_exit_minutes": IDLE_EXIT_MINUTES,
                 "streams": streams,
                 "uptime_seconds": round(time.time() - self.started_at, 1),
             }
@@ -333,8 +357,25 @@ class Status:
 status = Status()
 
 
+# Set by GET /wake: run discovery now instead of at the next interval.
+wake_event = threading.Event()
+
+
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
+        if self.path.split("?")[0] == "/wake":
+            # Reaching this line already did the real work: Fly started the
+            # machine to deliver the request. Count it as activity and look
+            # for the new stream right away.
+            status.touch()
+            wake_event.set()
+            payload = b'{"ok": true, "woken": true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if self.path.split("?")[0] not in ("/health", "/"):
             self.send_response(404)
             self.end_headers()
@@ -1960,10 +2001,10 @@ class StreamWorker(threading.Thread):
         self.detector = detector
         self.store = store
         self.url = RTSP_URL if RTSP_URL else rtsp_url_for(path)
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()  # not `_stop`: Thread uses that name internally (join)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
 
     # -- main loop ---------------------------------------------------------- #
 
@@ -1972,7 +2013,7 @@ class StreamWorker(threading.Thread):
         status.update(self.session_id, path=self.path, connected=False, reconnects=0)
         backoff = BACKOFF_MIN
         reconnects = 0
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 self._run_once()
                 log.warning("[%s] stream ended", self.path)
@@ -1986,7 +2027,7 @@ class StreamWorker(threading.Thread):
             status.update(
                 self.session_id, connected=False, active_tracks=0, reconnects=reconnects
             )
-            if self._stop.wait(backoff):
+            if self._stop_event.wait(backoff):
                 break
             backoff = min(BACKOFF_MAX, backoff * 2)
 
@@ -2061,12 +2102,12 @@ class StreamWorker(threading.Thread):
         last_locked_poll = 0.0
 
         try:
-            while not self._stop.is_set():
+            while not self._stop_event.is_set():
                 # Pace to DETECTION_FPS: sleep the exact remainder of the frame
                 # interval, then take the newest frame the moment it exists.
                 pause = MIN_FRAME_INTERVAL - (time.time() - last_inference)
                 if pause > 0:
-                    self._stop.wait(pause)
+                    self._stop_event.wait(pause)
                     continue
                 frame, seq, error, grabbed_at = grabber.wait_newer(last_seq, 0.5)
                 if error:
@@ -2393,7 +2434,23 @@ def supervise(detector, store: DetectionStore) -> None:
             workers[session_id] = worker
             worker.start()
 
-        time.sleep(DISCOVERY_INTERVAL_SECONDS)
+        if IDLE_EXIT_MINUTES > 0 and status.idle_seconds() >= IDLE_EXIT_MINUTES * 60:
+            log.info(
+                "No video for %.0f min — exiting so the machine can sleep "
+                "(MediaMTX wakes it through /wake)",
+                IDLE_EXIT_MINUTES,
+            )
+            for worker in workers.values():
+                worker.stop()
+            for worker in workers.values():
+                worker.join(timeout=5)  # clears their rows / sends empty snapshots
+            time.sleep(0.5)  # let a final empty broadcast leave the socket
+            raise SystemExit(0)
+
+        # Sleep until the next discovery round, or until /wake says a stream
+        # (or a viewer) just appeared.
+        wake_event.wait(DISCOVERY_INTERVAL_SECONDS)
+        wake_event.clear()
 
 
 def main() -> None:
@@ -2416,10 +2473,11 @@ def main() -> None:
     status.model = detector.model_path
     log.info("Detector config: %s", detector.describe())
     log.info(
-        "Auto-discovery every %.0fs from %s (max %d stream(s))",
+        "Auto-discovery every %.0fs from %s (max %d stream(s))%s",
         DISCOVERY_INTERVAL_SECONDS,
         RTSP_BASE_URL,
         MAX_STREAMS,
+        f", sleeps after {IDLE_EXIT_MINUTES:g} min without video" if IDLE_EXIT_MINUTES > 0 else "",
     )
 
     store = DetectionStore()
