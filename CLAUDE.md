@@ -96,6 +96,17 @@ download.pytorch.org are blocked), so:
   an upsert that the atlas_detections INSERT policy (track_id < 0) rejects.
   The fix is a SECURITY DEFINER RPC (lock_detection/unlock_detection) in the
   Lovable project, not a detector change.
+- Scale to zero (v59): the detector exits after IDLE_EXIT_MINUTES=10 without
+  video and the machine stops (min_machines_running = 0). MediaMTX in the
+  `live-video` app (repo Avisafety/live_video, `mediamtx.yml` runOnReady /
+  runOnRead) wakes it with `wget http://atlas-detector.flycast/wake`; the
+  private Flycast IP is fdaa:38:d7df:0:1::2. A stopped machine is normal —
+  `fly status` showing "stopped" between flights is not an outage. Test the
+  wake path with
+  `fly ssh console -a live-video -C "wget -T 20 -O - http://atlas-detector.flycast/wake"`.
+  Deploying live-video interrupts all video briefly (publishers reconnect);
+  do it only with the owner's yes and preferably when nobody is flying. It
+  has its own deploy token in the environment.
 - The Lovable project must never edit or deploy a copy of this detector; the
   detector is maintained only here.
 - Planned next: track-guided native-resolution crops for range, camera-motion
