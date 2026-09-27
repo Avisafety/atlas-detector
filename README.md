@@ -3,7 +3,7 @@
 Continuous object detection and tracking (person / vehicle / vessel / aircraft
 and more) on Atlas drone video. It discovers every active flight with a live
 Atlas stream from Supabase, reads each stream over RTSP from MediaMTX on the
-Fly private network, runs YOLO26n + ByteTrack on CPU, and writes tracked
+Fly private network, runs YOLO26n (ONNX Runtime) + ByteTrack on CPU, and writes tracked
 objects to the Supabase table `atlas_detections` so the Avisafe frontend can
 draw a live overlay through Supabase Realtime.
 
@@ -26,6 +26,34 @@ No serial number is configured: a supervisor loop polls Supabase every
 sensor registered in `atlas_drone_sensors`, and starts one worker per stream
 (up to `MAX_STREAMS`). Workers stop — and their boxes are deleted — when the
 flight ends or the stream goes stale.
+
+## Getting boxes to the browser
+
+`DETECTIONS_TRANSPORT` selects the path:
+
+| Value | What happens |
+|---|---|
+| `postgres` | Every track is upserted into `atlas_detections`; the frontend listens to Postgres Changes (the original behaviour). |
+| `broadcast` | One Supabase Realtime **Broadcast** snapshot per frame on the private channel `atlas-detections:<flight_session_id>` (event `tracks`). Only locked tracks are still written to the table. |
+| `both` | Both at once — for the transition; the frontend prefers Broadcast. |
+
+Snapshot payload (a track missing from a snapshot is gone):
+
+```json
+{ "v": 1, "flight_session_id": "uuid", "sent_at": 1727330000123,
+  "tracks": [ { "id": 17, "cls": "person", "conf": 0.84,
+                "x": 0.41, "y": 0.22, "w": 0.05, "h": 0.12,
+                "vx": 0.012, "vy": -0.003, "locked": false } ] }
+```
+
+Coordinates are normalised (top-left + size), `vx`/`vy` in normalised units
+per second so the frontend can glide boxes between snapshots. Snapshots are
+throttled to `BROADCAST_MAX_HZ`; with nothing detected an empty keep-alive is
+sent every `BROADCAST_IDLE_SECONDS`, and an empty snapshot is sent right away
+when a stream drops. Messages go over one persistent Realtime websocket
+(~10 ms each from Fly); while it is down they fall back to the Realtime REST
+endpoint (~110 ms). Viewers are authorised by the RLS policy on
+`realtime.messages`.
 
 ## Two cooperating passes, one tracker
 
@@ -87,10 +115,12 @@ fly secrets set \
 | `DISCOVERY_INTERVAL_SECONDS` | `10` | How often live streams are (re)discovered |
 | `SENSOR_STALE_SECONDS` | `300` | A sensor counts as live for this long |
 | `DETECTION_FPS` | `10` | Fast-pass frames analysed per second |
+| `MODEL_PATH` | `yolo26n.onnx` | Model file; the ONNX export is baked into the image |
+| `FALLBACK_MODEL_PATH` | `yolo26n.pt` | Used when `MODEL_PATH` is missing or fails to load |
 | `DETECTION_CLASSES` | `person,bicycle,car,motorcycle,airplane,bus,train,truck,boat,bird,dog,horse,sheep,cow,kite,surfboard` | COCO class names; the UI filters which are drawn |
 | `DETECTION_CONFIDENCE` | `0.20` | Fast-pass minimum score (UI filters further) |
 | `INFER_MAX_SIDE` | `640` | Fast-pass downscale, longest side (0 = off) |
-| `TRACKER_LOST_BUFFER` | `5` | Analysed frames a lost track survives |
+| `TRACKER_LOST_BUFFER` | `15` | Analysed frames a lost track survives |
 | `TRACK_TTL_SECONDS` | `0.8` | Stale tracks are deleted after this |
 | `RANGE_PASS_ENABLED` | `true` | Tiled full-resolution range pass on/off |
 | `RANGE_PASS_INTERVAL_SECONDS` | `2.0` | Range-pass cadence |
@@ -101,15 +131,49 @@ fly secrets set \
 | `RANGE_CONTAINMENT` | `0.7` | Containment (overlap / smaller box) at which duplicates are merged |
 | `RANGE_RESULT_MAX_AGE_SECONDS` | `0` | Max age of re-fed range boxes (0 = interval + 0.5 s) |
 | `RANGE_DEBUG` | `false` | Temporary per-source / per-suppression logging |
+| `LOG_SUMMARY_SECONDS` | `10` | Interval of the per-stream summary log line and `/health` metrics |
+| `LOG_EVERY_FRAME` | `false` | Also log one line per analysed frame (very verbose) |
+| `DB_WRITER_THREADS` | `MAX_STREAMS` | Parallel Supabase writers (one per stream slot) |
+| `DETECTIONS_TRANSPORT` | `both` | `postgres`, `broadcast` or `both` (see above) |
+| `BROADCAST_MAX_HZ` | `10` | Broadcast snapshots per second per stream |
+| `BROADCAST_IDLE_SECONDS` | `1.0` | Keep-alive interval for empty snapshots |
+| `BROADCAST_TOPIC_PREFIX` | `atlas-detections:` | Channel name prefix (+ flight_session_id) |
+| `BROADCAST_EVENT` | `tracks` | Broadcast event name |
 
 ## Health
 
 `GET /health` returns connection state, last frame age, active track count and
-reconnect count — used by the Fly health check in `fly.toml`.
+reconnect count — used by the Fly health check in `fly.toml`. It also carries a
+rolling `metrics` block per stream and a `db_writer` block, refreshed every
+`LOG_SUMMARY_SECONDS`:
+
+| Field | Meaning |
+|---|---|
+| `fps` | Fast-pass frames actually analysed per second |
+| `avg_frame_age_ms` | Decode → analysis start (how stale the analysed frame is) |
+| `avg_queue_ms` | Time spent waiting for the shared model (contention) |
+| `avg_infer_ms` | Model time per fast-pass frame |
+| `avg_loop_ms` / `max_loop_ms` | Analysis start → rows handed to the writer |
+| `range_scan_ms` | Duration of the last full range pass |
+| `db_writer.skipped_batches` | Frames whose rows were replaced before being written (writer too slow) |
+
+The same numbers are logged as one line per stream every `LOG_SUMMARY_SECONDS`,
+so the live log in the Fly dashboard stays readable.
+
+Inference is shared by all streams through a priority queue: fast-pass frames
+go before range-pass tiles, and anything that has waited 250 ms goes next, so
+the range pass is never starved when many streams are busy.
+
+## Benchmark
+
+`python bench.py [image] [runs]` times the fast pass and a range tile on every
+model file present (`yolo26n.pt`, `yolo26n.onnx`) and checks that the backends
+agree on the boxes. Run it on the target machine to size `MAX_STREAMS`.
 
 ## Notes
 
-- CPU only; runs on a dedicated-CPU Fly machine (`performance-2x`).
+- CPU only; runs on a dedicated-CPU Fly machine (`performance-2x`). The ONNX
+  Runtime export is ~3x faster than PyTorch with the same boxes.
 - Bounding boxes are normalised to 0–1 relative to frame width/height.
 - One row per `(flight_session_id, track_id)`; stale rows are pruned by a
   background loop and cleared entirely when the stream drops.

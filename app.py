@@ -1,8 +1,8 @@
 """atlas-detector — continuous object detection and tracking on Atlas drone video.
 
 Discovers every active flight that has a live Atlas video stream, reads each
-stream over RTSP from MediaMTX, runs YOLOv8n + ByteTrack on a subset of the
-frames, and upserts one row per tracked object into the Supabase table
+stream over RTSP from MediaMTX, runs YOLO26n (ONNX Runtime) + ByteTrack on a
+subset of the frames, and upserts one row per tracked object into the Supabase table
 `atlas_detections` (unique on flight_session_id + track_id). A cleanup loop
 deletes tracks that stopped being updated.
 
@@ -26,7 +26,7 @@ CPU only. Everything is configured through environment variables:
                                 kite,surfboard (any COCO class works)
   DETECTION_CONFIDENCE          default 0.20 (the UI filters further)
   INFER_MAX_SIDE                downscale longest side before inference, default 640
-  TRACKER_LOST_BUFFER           analysed frames a lost track survives, default 5
+  TRACKER_LOST_BUFFER           analysed frames a lost track survives, default 15
   TRACK_TTL_SECONDS             default 0.8
   RANGE_PASS_ENABLED            tiled full-res pass for small/distant objects
   RANGE_PASS_INTERVAL_SECONDS   cadence of the range pass, default 2.0
@@ -43,6 +43,11 @@ CPU only. Everything is configured through environment variables:
   MOTION_CONFIRM_HITS           analyses in a row before publishing, default 3
   MOTION_MIN_INLIERS            RANSAC inliers required, default 12
   MOTION_CONFIDENCE             fixed confidence for unknown boxes, default 0.10
+  MODEL_PATH                    default yolo26n.onnx (falls back to FALLBACK_MODEL_PATH)
+  FALLBACK_MODEL_PATH           default yolo26n.pt
+  LOG_SUMMARY_SECONDS           per-stream summary log + /health metrics, default 10
+  LOG_EVERY_FRAME               one log line per analysed frame, default false
+  DB_WRITER_THREADS             parallel Supabase writers, default MAX_STREAMS
   LOCK_POLL_SECONDS             how often the UI lock flag is read, default 2.0
   LOCK_ROI_PADDING              padding around the locked box, default 0.6
   LOCK_ROI_CONFIDENCE           threshold inside the locked ROI, default 0.08
@@ -51,6 +56,7 @@ CPU only. Everything is configured through environment variables:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -70,6 +76,11 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("atlas-detector")
+# httpx logs every Supabase request at INFO — ~5 lines/s from the prune loop
+# alone — which buried the per-stream summaries and shrank Fly's log buffer to
+# ~20 seconds. Failed requests still surface through our own warnings.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -211,7 +222,43 @@ def class_group(label: str) -> str:
             return next(iter(sorted(group)))
     return label
 
-MODEL_PATH = os.environ.get("MODEL_PATH", "yolo26n.pt")
+# ONNX Runtime export of YOLO26n (baked into the image): ~3x faster than
+# PyTorch on CPU with the same boxes. If it is missing or fails to load, the
+# detector falls back to the PyTorch weights, so a bad export never takes the
+# service down.
+MODEL_PATH = os.environ.get("MODEL_PATH", "yolo26n.onnx")
+FALLBACK_MODEL_PATH = os.environ.get("FALLBACK_MODEL_PATH", "yolo26n.pt")
+
+# Observability: one summary line per stream every LOG_SUMMARY_SECONDS instead
+# of one line per analysed frame (40+ lines/s made the live log unreadable).
+LOG_SUMMARY_SECONDS = float(os.environ.get("LOG_SUMMARY_SECONDS", "10") or 10)
+LOG_EVERY_FRAME = os.environ.get("LOG_EVERY_FRAME", "false").lower() == "true"
+
+# Parallel Supabase writer threads (one lane per stream slot by default).
+DB_WRITER_THREADS = int(os.environ.get("DB_WRITER_THREADS", "0") or 0) or MAX_STREAMS
+
+# How boxes reach the browser:
+#   postgres  — upsert every track into atlas_detections (Postgres Changes)
+#   broadcast — one Realtime Broadcast snapshot per frame on a private
+#               channel; only LOCKED tracks are still written to the table
+#   both      — do both (transition period; frontend picks broadcast)
+DETECTIONS_TRANSPORT = os.environ.get("DETECTIONS_TRANSPORT", "both").strip().lower()
+if DETECTIONS_TRANSPORT not in ("postgres", "broadcast", "both"):
+    DETECTIONS_TRANSPORT = "both"
+BROADCAST_ENABLED = DETECTIONS_TRANSPORT in ("broadcast", "both")
+# Snapshots per second per stream. The frontend extrapolates with vx/vy, so
+# 10 Hz looks smooth while keeping Realtime's messages/second quota (counted
+# per recipient) far away. Analysis itself still runs at DETECTION_FPS.
+BROADCAST_MAX_HZ = float(os.environ.get("BROADCAST_MAX_HZ", "10") or 10)
+# With nothing to show, a keep-alive empty snapshot this often lets the
+# frontend know Broadcast is alive without spending quota.
+BROADCAST_IDLE_SECONDS = float(os.environ.get("BROADCAST_IDLE_SECONDS", "1.0") or 1.0)
+BROADCAST_TOPIC_PREFIX = os.environ.get("BROADCAST_TOPIC_PREFIX", "atlas-detections:")
+BROADCAST_EVENT = os.environ.get("BROADCAST_EVENT", "tracks")
+
+# Inference priorities: lower value runs first when the model is contended.
+PRIORITY_FAST = 0
+PRIORITY_RANGE = 1
 
 # Backoff bounds for reconnecting to MediaMTX.
 BACKOFF_MIN = 1.0
@@ -233,6 +280,9 @@ class Status:
         self.lock = threading.Lock()
         self.streams: dict[str, dict] = {}
         self.started_at = time.time()
+        self.model = MODEL_PATH
+        self.writer: dict = {}
+        self.broadcast: dict = {}
 
     def update(self, session_id: str, **fields) -> None:
         with self.lock:
@@ -258,13 +308,18 @@ class Status:
                         "last_frame_age_seconds": (
                             None if last is None else round(time.time() - last, 2)
                         ),
+                        # Rolling window, refreshed every LOG_SUMMARY_SECONDS.
+                        "metrics": entry.get("metrics", {}),
                     }
                 )
             return {
                 "ok": True,
                 "service": "atlas-detector",
                 "engine": "yolo",
-                "model": MODEL_PATH,
+                "model": self.model,
+                "db_writer": self.writer,
+                "transport": DETECTIONS_TRANSPORT,
+                "broadcast": self.broadcast,
                 "detection_fps": DETECTION_FPS,
                 "confidence": DETECTION_CONFIDENCE,
                 "classes": DETECTION_CLASSES,
@@ -306,17 +361,58 @@ def start_health_server() -> None:
 # --------------------------------------------------------------------------- #
 
 
+class PriorityLock:
+    """Mutex that hands the model to the most urgent waiter first.
+
+    A plain Lock lets a range-pass tile grab the model while a fast-pass frame
+    is waiting, which shows up directly as box latency. Here waiters are
+    served by (priority, arrival order): fast-pass frames of every stream go
+    before range tiles, and equal priorities stay first come, first served.
+
+    Anti-starvation: with several streams the fast passes alone can keep the
+    model busy all the time, which would stop the range pass completely (and
+    with it every distant object). A waiter that has queued longer than
+    `max_wait` seconds is therefore served next, whatever its priority.
+    """
+
+    def __init__(self, max_wait: float = 0.25) -> None:
+        self._cond = threading.Condition()
+        self._held = False
+        self._queue: list[tuple[int, int, float]] = []
+        self._seq = 0
+        self._max_wait = max_wait
+
+    def _next(self) -> tuple[int, int, float]:
+        oldest = min(self._queue, key=lambda t: t[1])
+        if time.monotonic() - oldest[2] >= self._max_wait:
+            return oldest
+        return min(self._queue)
+
+    def acquire(self, priority: int) -> None:
+        with self._cond:
+            self._seq += 1
+            ticket = (priority, self._seq, time.monotonic())
+            self._queue.append(ticket)
+            while self._held or self._next() != ticket:
+                # Timed wait so an aged waiter is noticed even without a release.
+                self._cond.wait(self._max_wait)
+            self._queue.remove(ticket)
+            self._held = True
+
+    def release(self) -> None:
+        with self._cond:
+            self._held = False
+            self._cond.notify_all()
+
+
 class YoloDetector:
     """YOLO26n (NMS-free, end-to-end) on a fixed COCO class list. Shared by every stream worker."""
 
     name = "yolo"
 
     def __init__(self) -> None:
-        from ultralytics import YOLO
-
-        log.info("Loading YOLO26 (%s)", MODEL_PATH)
-        self.model = YOLO(MODEL_PATH)
-        self._lock = threading.Lock()
+        self.model, self.model_path = self._load()
+        self._lock = PriorityLock()
 
         names: dict[int, str] = {int(k): str(v).lower() for k, v in self.model.names.items()}
         self.class_ids = {cid: n for cid, n in names.items() if n in DETECTION_CLASSES}
@@ -326,25 +422,66 @@ class YoloDetector:
         if not self.class_ids:
             raise SystemExit("No valid classes in DETECTION_CLASSES")
 
+    @staticmethod
+    def _load():
+        """Load MODEL_PATH, falling back to FALLBACK_MODEL_PATH on any failure.
+
+        The candidate must also survive one real inference: an export that
+        loads but cannot run is caught here, at startup, not mid-flight.
+        """
+        from ultralytics import YOLO
+
+        candidates = [MODEL_PATH]
+        if FALLBACK_MODEL_PATH and FALLBACK_MODEL_PATH != MODEL_PATH:
+            candidates.append(FALLBACK_MODEL_PATH)
+        last_exc: Exception | None = None
+        for path in candidates:
+            if not path.endswith(".pt") and not os.path.exists(path):
+                log.warning("Model %s not found, trying next", path)
+                continue
+            try:
+                log.info("Loading YOLO26 (%s)", path)
+                model = YOLO(path, task="detect")
+                model.predict(np.zeros((360, 640, 3), dtype=np.uint8), verbose=False)
+                return model, path
+            except Exception as exc:
+                last_exc = exc
+                log.warning("Model %s failed to load (%s), trying next", path, exc)
+        raise SystemExit(f"No usable model (last error: {last_exc})")
+
     def describe(self) -> str:
         return (
-            f"engine=yolo model={MODEL_PATH} "
+            f"engine=yolo model={self.model_path} "
             f"classes={','.join(sorted(self.class_ids.values()))} "
             f"confidence={DETECTION_CONFIDENCE} fps={DETECTION_FPS}"
         )
 
     def detect(
-        self, frame, conf: float | None = None
+        self,
+        frame,
+        conf: float | None = None,
+        priority: int = PRIORITY_FAST,
+        timing: dict | None = None,
     ) -> tuple[sv.Detections, list[str]]:
         # One model instance shared by all workers: serialise inference so two
-        # streams cannot corrupt each other's state.
-        with self._lock:
+        # streams cannot corrupt each other's state. Fast-pass frames jump the
+        # queue ahead of range tiles (see PriorityLock).
+        queued = time.perf_counter()
+        self._lock.acquire(priority)
+        try:
+            started = time.perf_counter()
             result = self.model.predict(
                 frame,
                 conf=conf if conf is not None else DETECTION_CONFIDENCE,
                 classes=sorted(self.class_ids.keys()),
                 verbose=False,
             )[0]
+            finished = time.perf_counter()
+        finally:
+            self._lock.release()
+        if timing is not None:
+            timing["wait_ms"] = (started - queued) * 1000.0
+            timing["infer_ms"] = (finished - started) * 1000.0
         detections = sv.Detections.from_ultralytics(result)
         class_ids = (
             detections.class_id
@@ -365,14 +502,36 @@ class DetectionStore:
 
     def __init__(self) -> None:
         self.client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-        # Writes happen on a background thread: a network round-trip inside the
+        # Writes happen on background threads: a network round-trip inside the
         # detection loop costs 50-200 ms per frame, which shows up directly as
         # boxes lagging behind the video. Only the newest rows per session are
         # kept, so a slow write is skipped instead of queued.
-        self._pending: dict[str, list[dict]] = {}
-        self._pending_lock = threading.Lock()
-        self._pending_event = threading.Event()
-        threading.Thread(target=self._writer_loop, daemon=True).start()
+        #
+        # One writer "lane" per stream slot, each with its own client: a single
+        # writer serialises every stream behind one ~50 ms round trip, which
+        # caps the whole machine at ~20 writes/s. A session always maps to the
+        # same lane, so its writes stay in order; sessions are spread over the
+        # lanes round-robin (hashing can put every session in one lane).
+        self._stats_lock = threading.Lock()
+        self._lane_of: dict[str, dict] = {}
+        self._next_lane = 0
+        self._stats = self._empty_stats()
+        self.broadcaster = Broadcaster() if BROADCAST_ENABLED else None
+        self._lanes = []
+        for idx in range(max(1, DB_WRITER_THREADS)):
+            lane = {
+                "client": self.client if idx == 0 else create_client(
+                    SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+                ),
+                "pending": {},
+                "lock": threading.Lock(),
+                "event": threading.Event(),
+            }
+            self._lanes.append(lane)
+            threading.Thread(
+                target=self._writer_loop, args=(lane, idx == 0), daemon=True,
+                name=f"db-writer-{idx}",
+            ).start()
 
     # -- detections --------------------------------------------------------- #
 
@@ -380,28 +539,86 @@ class DetectionStore:
         if not rows:
             return
         key = str(rows[0].get("flight_session_id") or "")
-        with self._pending_lock:
-            self._pending[key] = rows
-        self._pending_event.set()
+        lane = self._lane_for(key)
+        with lane["lock"]:
+            skipped = key in lane["pending"]
+            lane["pending"][key] = rows
+        if skipped:
+            # The writer did not get to the previous batch in time.
+            with self._stats_lock:
+                self._stats["skipped"] += 1
+        lane["event"].set()
 
-    def _writer_loop(self) -> None:
+    def _lane_for(self, key: str) -> dict:
+        with self._stats_lock:
+            lane = self._lane_of.get(key)
+            if lane is None:
+                lane = self._lanes[self._next_lane % len(self._lanes)]
+                self._next_lane += 1
+                self._lane_of[key] = lane
+            return lane
+
+    def _writer_loop(self, lane: dict, reports: bool) -> None:
+        window_start = time.time()
         while True:
-            self._pending_event.wait(0.1)
-            self._pending_event.clear()
-            with self._pending_lock:
-                batches = list(self._pending.values())
-                self._pending.clear()
+            lane["event"].wait(0.1)
+            lane["event"].clear()
+            with lane["lock"]:
+                batches = list(lane["pending"].values())
+                lane["pending"].clear()
             for rows in batches:
-                self._write(rows)
+                self._write(lane["client"], rows)
+            if reports:
+                now = time.time()
+                if now - window_start >= LOG_SUMMARY_SECONDS:
+                    self._report(now - window_start)
+                    window_start = now
 
-    def _write(self, rows: list[dict]) -> None:
+    def _write(self, client, rows: list[dict]) -> None:
+        started = time.perf_counter()
+        failed = False
         try:
-            self.client.table("atlas_detections").upsert(
+            client.table("atlas_detections").upsert(
                 rows, on_conflict="flight_session_id,track_id"
             ).execute()
         except Exception as exc:  # never let a write error kill the loop
+            failed = True
             log.warning("Upsert failed: %s", exc)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        with self._stats_lock:
+            self._stats["writes"] += 1
+            self._stats["failed"] += int(failed)
+            self._stats["total_ms"] += elapsed_ms
+            self._stats["max_ms"] = max(self._stats["max_ms"], elapsed_ms)
 
+    def _report(self, window: float) -> None:
+        """Publish and log the writers' throughput for the last window."""
+        with self._stats_lock:
+            s = self._stats
+            self._stats = self._empty_stats()
+        writes = s["writes"]
+        summary = {
+            "writes_per_second": round(writes / window, 1),
+            "avg_write_ms": round(s["total_ms"] / writes, 1) if writes else None,
+            "max_write_ms": round(s["max_ms"], 1) if writes else None,
+            "skipped_batches": s["skipped"],
+            "failed_writes": s["failed"],
+            "writer_threads": len(self._lanes),
+        }
+        status.writer = summary
+        if writes or s["skipped"] or s["failed"]:
+            log.info(
+                "db writer: %.1f writes/s, avg %s ms, max %s ms, %d skipped, %d failed",
+                summary["writes_per_second"],
+                summary["avg_write_ms"],
+                summary["max_write_ms"],
+                s["skipped"],
+                s["failed"],
+            )
+
+    @staticmethod
+    def _empty_stats() -> dict:
+        return {"writes": 0, "total_ms": 0.0, "max_ms": 0.0, "skipped": 0, "failed": 0}
 
     def prune(self, session_ids: list[str]) -> None:
         if not session_ids:
@@ -527,6 +744,396 @@ class DetectionStore:
         return streams
 
 
+class RealtimeSocket:
+    """One persistent Supabase Realtime websocket shared by every stream.
+
+    Speaks the Phoenix channel protocol Realtime uses: join
+    `realtime:<topic>` as a private channel with the service-role key, push
+    `broadcast` events, heartbeat every 25 s. Channels are joined on first use
+    and left after a minute without snapshots. Broadcast acks are requested so
+    delivery is confirmed and its round trip measured, but never awaited by the
+    sender. While the socket is down `submit` returns False and the caller
+    falls back to the REST endpoint.
+    """
+
+    HEARTBEAT_SECONDS = 25.0
+    IDLE_LEAVE_SECONDS = 60.0
+
+    def __init__(self, broadcaster) -> None:
+        self._broadcaster = broadcaster
+        base = SUPABASE_URL.rstrip("/")
+        base = base.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+        self._url = f"{base}/realtime/v1/websocket?apikey={SUPABASE_SERVICE_ROLE_KEY}&vsn=1.0.0"
+        self._lock = threading.Lock()
+        self._pending: dict[str, dict] = {}
+        self._loop = asyncio.new_event_loop()
+        self._wake: asyncio.Event | None = None
+        self.connected = False
+        threading.Thread(target=self._thread, daemon=True, name="realtime-ws").start()
+
+    # -- called from worker threads ------------------------------------------ #
+
+    def submit(self, session_id: str, payload: dict) -> tuple[bool, bool]:
+        """Queue a snapshot. Returns (accepted, replaced_an_unsent_one)."""
+        if not self.connected or self._wake is None:
+            return False, False
+        with self._lock:
+            skipped = session_id in self._pending
+            self._pending[session_id] = payload
+        self._loop.call_soon_threadsafe(self._wake.set)
+        return True, skipped
+
+    # -- event loop ------------------------------------------------------------ #
+
+    def _thread(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_until_complete(self._run_forever())
+
+    async def _run_forever(self) -> None:
+        import websockets
+
+        self._wake = asyncio.Event()
+        backoff = BACKOFF_MIN
+        while True:
+            try:
+                async with websockets.connect(
+                    self._url, ping_interval=None, open_timeout=10, max_size=None
+                ) as ws:
+                    backoff = BACKOFF_MIN
+                    await self._session(ws)
+            except Exception as exc:
+                # The URL carries the service-role key: never let it reach a log.
+                reason = str(exc).replace(SUPABASE_SERVICE_ROLE_KEY, "***") if SUPABASE_SERVICE_ROLE_KEY else str(exc)
+                log.warning("Realtime websocket lost (%s); using REST until it is back", reason)
+            finally:
+                self.connected = False
+            await asyncio.sleep(backoff)
+            backoff = min(BACKOFF_MAX, backoff * 2)
+
+    async def _session(self, ws) -> None:
+        refs = iter(range(1, 1 << 62))
+        joined: dict[str, float] = {}           # topic -> last snapshot time
+        join_waiters: dict[str, asyncio.Future] = {}
+        sent_at: dict[str, float] = {}          # broadcast ref -> perf_counter
+
+        async def reader() -> None:
+            async for raw in ws:
+                msg = json.loads(raw)
+                event, ref, topic = msg.get("event"), msg.get("ref"), msg.get("topic")
+                if event == "phx_reply":
+                    ok = (msg.get("payload") or {}).get("status") == "ok"
+                    if ref in join_waiters:
+                        join_waiters.pop(ref).set_result(msg.get("payload"))
+                    elif ref in sent_at:
+                        ms = (time.perf_counter() - sent_at.pop(ref)) * 1000.0
+                        error = None if ok else f"broadcast rejected: {msg.get('payload')}"
+                        self._broadcaster.record("ws", ms, error)
+                elif event in ("phx_error", "phx_close") and topic in joined:
+                    joined.pop(topic, None)  # rejoin on next snapshot
+
+        async def heartbeat() -> None:
+            while True:
+                await asyncio.sleep(self.HEARTBEAT_SECONDS)
+                await ws.send(json.dumps(
+                    {"topic": "phoenix", "event": "heartbeat", "payload": {}, "ref": str(next(refs))}
+                ))
+
+        async def join(topic: str) -> None:
+            ref = str(next(refs))
+            waiter = asyncio.get_running_loop().create_future()
+            join_waiters[ref] = waiter
+            await ws.send(json.dumps({
+                "topic": topic, "event": "phx_join", "ref": ref, "join_ref": ref,
+                "payload": {
+                    "config": {
+                        "broadcast": {"ack": True, "self": False},
+                        "presence": {"key": ""},
+                        "private": True,
+                    },
+                    "access_token": SUPABASE_SERVICE_ROLE_KEY,
+                },
+            }))
+            reply = await asyncio.wait_for(waiter, timeout=10)
+            if (reply or {}).get("status") != "ok":
+                raise RuntimeError(f"join {topic} refused: {reply}")
+
+        tasks = [asyncio.ensure_future(reader()), asyncio.ensure_future(heartbeat())]
+        self.connected = True
+        log.info("Realtime websocket connected")
+        try:
+            while True:
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+                self._wake.clear()
+                for task in tasks:
+                    if task.done():
+                        raise task.exception() or ConnectionError("socket closed")
+                with self._lock:
+                    batch = list(self._pending.items())
+                    self._pending.clear()
+                now = time.time()
+                for session_id, payload in batch:
+                    topic = f"realtime:{Broadcaster.topic(session_id)}"
+                    if topic not in joined:
+                        await join(topic)
+                    joined[topic] = now
+                    ref = str(next(refs))
+                    sent_at[ref] = time.perf_counter()
+                    await ws.send(json.dumps({
+                        "topic": topic, "event": "broadcast", "ref": ref, "join_ref": ref,
+                        "payload": {"type": "broadcast", "event": BROADCAST_EVENT, "payload": payload},
+                    }))
+                # Housekeeping: leave idle channels, forget acks that never came.
+                for topic in [t for t, last in joined.items() if now - last > self.IDLE_LEAVE_SECONDS]:
+                    joined.pop(topic, None)
+                    await ws.send(json.dumps(
+                        {"topic": topic, "event": "phx_leave", "payload": {}, "ref": str(next(refs))}
+                    ))
+                stale = time.perf_counter() - 10.0
+                for ref in [r for r, t in sent_at.items() if t < stale]:
+                    sent_at.pop(ref, None)
+                    self._broadcaster.record("ws", None, "broadcast not acknowledged within 10 s")
+        finally:
+            self.connected = False
+            for task in tasks:
+                task.cancel()
+
+
+class Broadcaster:
+    """Pushes one Realtime Broadcast snapshot per frame to a private channel.
+
+    Postgres Changes turns every changed row into a Realtime message for every
+    viewer, after a database write, WAL decoding and an RLS check. A snapshot
+    is one message per frame no matter how many tracks it holds, and never
+    touches the database.
+
+    Primary path: one persistent Realtime websocket (RealtimeSocket), ~10 ms
+    per message from Fly. Fallback while the socket is down: the Realtime REST
+    endpoint (~110 ms per request), through one lane (own HTTP client) per
+    stream slot. Both use the service-role key, which may publish to private
+    channels; viewers are authorised by the RLS policy on realtime.messages.
+    Newest snapshot wins everywhere: a slow send is skipped, never queued.
+    """
+
+    def __init__(self) -> None:
+        import httpx
+
+        self._url = f"{SUPABASE_URL.rstrip('/')}/realtime/v1/api/broadcast"
+        self._headers = {
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "Content-Type": "application/json",
+        }
+        self._stats_lock = threading.Lock()
+        self._stats = self._empty_stats()
+        self._last_error: str | None = None
+        self._lane_of: dict[str, dict] = {}
+        self._next_lane = 0
+        self._lanes = []
+        for idx in range(max(1, DB_WRITER_THREADS)):
+            lane = {
+                "client": httpx.Client(timeout=5.0),
+                "pending": {},
+                "lock": threading.Lock(),
+                "event": threading.Event(),
+            }
+            self._lanes.append(lane)
+            threading.Thread(
+                target=self._sender_loop, args=(lane, idx == 0), daemon=True,
+                name=f"broadcast-{idx}",
+            ).start()
+        self._socket = RealtimeSocket(self)
+
+    @staticmethod
+    def topic(session_id: str) -> str:
+        return f"{BROADCAST_TOPIC_PREFIX}{session_id}"
+
+    def publish(self, session_id: str, tracks: list[dict]) -> None:
+        """Queue a snapshot (the complete track list) for one flight."""
+        payload = {
+            "v": 1,
+            "flight_session_id": session_id,
+            "sent_at": int(time.time() * 1000),
+            "tracks": tracks,
+        }
+        accepted, skipped = self._socket.submit(session_id, payload)
+        if not accepted:
+            lane = self._lane_for(session_id)
+            with lane["lock"]:
+                skipped = session_id in lane["pending"]
+                lane["pending"][session_id] = payload
+            lane["event"].set()
+        if skipped:
+            with self._stats_lock:
+                self._stats["skipped"] += 1
+
+    def _lane_for(self, key: str) -> dict:
+        with self._stats_lock:
+            lane = self._lane_of.get(key)
+            if lane is None:
+                lane = self._lanes[self._next_lane % len(self._lanes)]
+                self._next_lane += 1
+                self._lane_of[key] = lane
+            return lane
+
+    def record(self, via: str, ms: float | None = None, error: str | None = None) -> None:
+        """Account one sent message (ms = delivery round trip when known)."""
+        with self._stats_lock:
+            self._stats["sent_" + via] += 1
+            if ms is not None:
+                self._stats["timed"] += 1
+                self._stats["total_ms"] += ms
+                self._stats["max_ms"] = max(self._stats["max_ms"], ms)
+            if error:
+                self._stats["failed"] += 1
+                first = self._last_error is None
+                self._last_error = error
+        if error and first:
+            # Logged once; afterwards the count shows up in the summary line.
+            log.warning("Broadcast failed: %s (further failures are counted)", error)
+
+    def _sender_loop(self, lane: dict, reports: bool) -> None:
+        window_start = time.time()
+        while True:
+            lane["event"].wait(0.1)
+            lane["event"].clear()
+            with lane["lock"]:
+                payloads = list(lane["pending"].values())
+                lane["pending"].clear()
+            for payload in payloads:
+                self._send(lane["client"], payload)
+            if reports:
+                now = time.time()
+                if now - window_start >= LOG_SUMMARY_SECONDS:
+                    self._report(now - window_start)
+                    window_start = now
+
+    def _post(self, client, body: dict) -> int:
+        return client.post(self._url, headers=self._headers, json=body).status_code
+
+    def _send(self, client, payload: dict) -> None:
+        body = {
+            "messages": [
+                {
+                    "topic": self.topic(payload["flight_session_id"]),
+                    "event": BROADCAST_EVENT,
+                    "payload": payload,
+                    "private": True,
+                }
+            ]
+        }
+        started = time.perf_counter()
+        error = None
+        try:
+            code = self._post(client, body)
+            if code >= 300:
+                error = f"HTTP {code}"
+        except Exception as exc:  # never let a send error kill the loop
+            error = str(exc)
+        self.record("rest", (time.perf_counter() - started) * 1000.0, error)
+
+    def _report(self, window: float) -> None:
+        with self._stats_lock:
+            s = self._stats
+            self._stats = self._empty_stats()
+            last_error = self._last_error
+            if not s["failed"]:
+                self._last_error = None
+        sent = s["sent_ws"] + s["sent_rest"]
+        timed = s["timed"]
+        summary = {
+            "messages_per_second": round(sent / window, 1),
+            "via_websocket": s["sent_ws"],
+            "via_rest": s["sent_rest"],
+            "avg_ack_ms": round(s["total_ms"] / timed, 1) if timed else None,
+            "max_ack_ms": round(s["max_ms"], 1) if timed else None,
+            "skipped": s["skipped"],
+            "failed": s["failed"],
+            "last_error": last_error if s["failed"] else None,
+            "websocket_connected": self._socket.connected,
+        }
+        status.broadcast = summary
+        if sent or s["skipped"] or s["failed"]:
+            log.info(
+                "broadcast: %.1f msg/s (%d websocket, %d rest), ack avg %s ms, "
+                "max %s ms, %d skipped, %d failed%s",
+                summary["messages_per_second"],
+                s["sent_ws"],
+                s["sent_rest"],
+                summary["avg_ack_ms"],
+                summary["max_ack_ms"],
+                s["skipped"],
+                s["failed"],
+                f" ({last_error})" if s["failed"] else "",
+            )
+
+    @staticmethod
+    def _empty_stats() -> dict:
+        return {
+            "sent_ws": 0, "sent_rest": 0, "timed": 0, "total_ms": 0.0,
+            "max_ms": 0.0, "skipped": 0, "failed": 0,
+        }
+
+
+class VelocityEstimator:
+    """Smoothed per-track velocity in normalised units per second.
+
+    Sent with every snapshot so the frontend can glide boxes between
+    snapshots instead of letting them jump at 10 Hz.
+    """
+
+    def __init__(self, alpha: float = 0.5, max_gap: float = 1.0) -> None:
+        self._alpha = alpha
+        self._max_gap = max_gap
+        self._state: dict[int, tuple[float, float, float, float, float]] = {}
+
+    def update(self, track_id: int, cx: float, cy: float, now: float) -> tuple[float, float]:
+        prev = self._state.get(track_id)
+        vx = vy = 0.0
+        if prev is not None:
+            px, py, pt, pvx, pvy = prev
+            dt = now - pt
+            if 0.0 < dt <= self._max_gap:
+                a = self._alpha
+                vx = a * (cx - px) / dt + (1.0 - a) * pvx
+                vy = a * (cy - py) / dt + (1.0 - a) * pvy
+        self._state[track_id] = (cx, cy, now, vx, vy)
+        return vx, vy
+
+    def forget_older_than(self, now: float, seconds: float = 2.0) -> None:
+        for tid in [t for t, st in self._state.items() if now - st[2] > seconds]:
+            self._state.pop(tid, None)
+
+
+def snapshot_tracks(rows: list[dict], locked_ids, velocity: VelocityEstimator, now: float) -> list[dict]:
+    """atlas_detections rows -> the compact track list of a broadcast snapshot."""
+    tracks = []
+    for row in rows:
+        box = row["bbox"]
+        tid = int(row["track_id"])
+        vx, vy = velocity.update(
+            tid, box["x"] + box["width"] / 2.0, box["y"] + box["height"] / 2.0, now
+        )
+        tracks.append(
+            {
+                "id": tid,
+                "cls": row["object_class"],
+                "conf": row["confidence"],
+                "x": box["x"],
+                "y": box["y"],
+                "w": box["width"],
+                "h": box["height"],
+                "vx": round(vx, 4),
+                "vy": round(vy, 4),
+                "locked": tid in locked_ids,
+            }
+        )
+    velocity.forget_older_than(now)
+    return tracks
+
+
 # --------------------------------------------------------------------------- #
 # Video capture
 # --------------------------------------------------------------------------- #
@@ -566,9 +1173,12 @@ class FrameGrabber:
 
     def __init__(self, cap: cv2.VideoCapture) -> None:
         self._cap = cap
-        self._lock = threading.Lock()
+        # A Condition instead of a plain Lock so the worker wakes the moment a
+        # frame is decoded instead of polling (polling added up to 20 ms).
+        self._lock = threading.Condition()
         self._frame = None
         self._seq = 0
+        self._grabbed_at = 0.0
         self._error: str | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True, name="grabber")
@@ -583,6 +1193,7 @@ class FrameGrabber:
                 if empty_reads > 60:
                     with self._lock:
                         self._error = "stream returned no frames"
+                        self._lock.notify_all()
                     return
                 time.sleep(0.05)
                 continue
@@ -590,10 +1201,20 @@ class FrameGrabber:
             with self._lock:
                 self._frame = frame
                 self._seq += 1
+                self._grabbed_at = time.time()
+                self._lock.notify_all()
 
-    def latest(self):
+    def wait_newer(self, seq: int, timeout: float):
+        """Block until a frame newer than `seq` exists (or an error/timeout).
+
+        Returns (frame, seq, error, grabbed_at) — the caller detects a timeout
+        by getting its own `seq` back.
+        """
         with self._lock:
-            return self._frame, self._seq, self._error
+            self._lock.wait_for(
+                lambda: self._seq != seq or self._error is not None, timeout
+            )
+            return self._frame, self._seq, self._error, self._grabbed_at
 
     def stop(self) -> None:
         self._stop.set()
@@ -1033,6 +1654,7 @@ class RangeScanner:
         self._detections: sv.Detections | None = None
         self._labels: list[str] = []
         self._updated_at: float = 0.0
+        self.last_scan_ms: float = 0.0
         self._thread = threading.Thread(
             target=self._run, daemon=True, name=f"range-{path}"
         )
@@ -1071,6 +1693,7 @@ class RangeScanner:
         log.info("[%s] range pass stopped", self._path)
 
     def _scan(self, frame) -> None:
+        scan_started = time.perf_counter()
         height, width = frame.shape[:2]
         all_xyxy: list[np.ndarray] = []
         all_conf: list[float] = []
@@ -1081,7 +1704,9 @@ class RangeScanner:
             tile = frame[y0:y1, x0:x1]
             if tile.size == 0:
                 continue
-            detections, labels = self._detector.detect(tile, conf=RANGE_CONFIDENCE)
+            detections, labels = self._detector.detect(
+                tile, conf=RANGE_CONFIDENCE, priority=PRIORITY_RANGE
+            )
             if len(detections) == 0:
                 continue
             boxes = detections.xyxy.copy()
@@ -1139,9 +1764,11 @@ class RangeScanner:
             self._detections = merged
             self._labels = all_labels
             self._updated_at = time.time()
-        log.info(
-            "[%s] range pass: %d object(s) in full frame", self._path, len(merged)
-        )
+        self.last_scan_ms = (time.perf_counter() - scan_started) * 1000.0
+        if RANGE_DEBUG:
+            log.info(
+                "[%s] range pass: %d object(s) in full frame", self._path, len(merged)
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -1275,6 +1902,54 @@ def lock_row(
 # --------------------------------------------------------------------------- #
 
 
+class StreamStats:
+    """Rolling per-stream latency counters, flushed every LOG_SUMMARY_SECONDS.
+
+    frame_age = decode -> analysis start, queue = waiting for the shared model,
+    infer = model time, loop = analysis start -> rows handed to the writer.
+    """
+
+    FIELDS = ("frame_age_ms", "wait_ms", "infer_ms", "loop_ms", "tracks")
+
+    def __init__(self) -> None:
+        self._reset(time.time())
+
+    def _reset(self, now: float) -> None:
+        self._started = now
+        self._count = 0
+        self._sums = dict.fromkeys(self.FIELDS, 0.0)
+        self._max_loop = 0.0
+
+    def add(self, **values: float) -> None:
+        self._count += 1
+        for key in self.FIELDS:
+            self._sums[key] += values.get(key, 0.0)
+        self._max_loop = max(self._max_loop, values.get("loop_ms", 0.0))
+
+    def due(self) -> bool:
+        return time.time() - self._started >= LOG_SUMMARY_SECONDS
+
+    def flush(self, range_scan_ms: float | None, locks: int) -> dict:
+        now = time.time()
+        n = max(1, self._count)
+        metrics = {
+            "fps": round(self._count / max(1e-6, now - self._started), 1),
+            "avg_frame_age_ms": round(self._sums["frame_age_ms"] / n, 1),
+            "avg_queue_ms": round(self._sums["wait_ms"] / n, 1),
+            "avg_infer_ms": round(self._sums["infer_ms"] / n, 1),
+            "avg_loop_ms": round(self._sums["loop_ms"] / n, 1),
+            "max_loop_ms": round(self._max_loop, 1),
+            "avg_tracks": round(self._sums["tracks"] / n, 1),
+            "range_scan_ms": None if range_scan_ms is None else round(range_scan_ms),
+            "locks": locks,
+            "window_seconds": round(now - self._started, 1),
+        }
+        self._reset(now)
+        return metrics
+
+
+
+
 class StreamWorker(threading.Thread):
     """Analyses a single RTSP stream until it is asked to stop."""
 
@@ -1306,6 +1981,7 @@ class StreamWorker(threading.Thread):
 
             # Drop stale boxes immediately so the UI never shows frozen overlays.
             self.store.clear(self.session_id)
+            self._broadcast_empty()
             reconnects += 1
             status.update(
                 self.session_id, connected=False, active_tracks=0, reconnects=reconnects
@@ -1315,8 +1991,14 @@ class StreamWorker(threading.Thread):
             backoff = min(BACKOFF_MAX, backoff * 2)
 
         self.store.clear(self.session_id)
+        self._broadcast_empty()
         status.remove(self.session_id)
         log.info("[%s] worker stopped", self.path)
+
+    def _broadcast_empty(self) -> None:
+        """Tell viewers right away that this stream has no boxes any more."""
+        if self.store.broadcaster is not None:
+            self.store.broadcaster.publish(self.session_id, [])
 
     def _run_once(self) -> None:
         cap = open_capture(self.url)
@@ -1326,11 +2008,14 @@ class StreamWorker(threading.Thread):
         status.update(self.session_id, connected=True)
         log.info("[%s] connected", self.path)
 
-        # Fast-reacting tracker: short memory for lost tracks and a frame rate
-        # that matches the actual analysis rate.
+        # Fast-reacting tracker with a short memory for lost tracks.
+        # supervision scales the buffer by frame_rate / 30, so frame_rate=30
+        # makes TRACKER_LOST_BUFFER mean exactly "analysed frames a lost track
+        # survives", as documented. (Passing DETECTION_FPS=20 silently cut a
+        # buffer of 5 down to 3 frames.)
         tracker = sv.ByteTrack(
             lost_track_buffer=TRACKER_LOST_BUFFER,
-            frame_rate=max(1, int(round(DETECTION_FPS))),
+            frame_rate=30,
             # Motion candidates carry a deliberately low, fixed confidence —
             # the tracker must still be allowed to open a track for them.
             track_activation_threshold=min(
@@ -1342,6 +2027,16 @@ class StreamWorker(threading.Thread):
         grabber = FrameGrabber(cap)
         last_seq = 0
         last_inference = 0.0
+        stats = StreamStats()
+        velocity = VelocityEstimator()
+        broadcaster = self.store.broadcaster
+        last_broadcast = 0.0
+        last_broadcast_empty = False
+        # Token bucket for BROADCAST_MAX_HZ: frames arrive with jitter, and a
+        # plain "at least 1/hz since the last send" check skipped every other
+        # frame whenever a frame came a few ms early (10 fps gave ~5 msg/s).
+        broadcast_budget = 1.0
+        budget_at = 0.0
 
         # Latest full-resolution frame, shared with the background scanners.
         full_frame_slot: dict = {"frame": None, "seq": -1}
@@ -1367,17 +2062,19 @@ class StreamWorker(threading.Thread):
 
         try:
             while not self._stop.is_set():
-                frame, seq, error = grabber.latest()
+                # Pace to DETECTION_FPS: sleep the exact remainder of the frame
+                # interval, then take the newest frame the moment it exists.
+                pause = MIN_FRAME_INTERVAL - (time.time() - last_inference)
+                if pause > 0:
+                    self._stop.wait(pause)
+                    continue
+                frame, seq, error, grabbed_at = grabber.wait_newer(last_seq, 0.5)
                 if error:
                     raise ConnectionError(error)
                 if frame is None or seq == last_seq:
-                    time.sleep(0.02)
                     continue
 
                 now = time.time()
-                if now - last_inference < MIN_FRAME_INTERVAL:
-                    time.sleep(min(0.02, MIN_FRAME_INTERVAL))
-                    continue
                 last_seq = seq
                 last_inference = now
                 status.update(self.session_id, last_frame_at=now)
@@ -1403,9 +2100,9 @@ class StreamWorker(threading.Thread):
                     )
                 height, width = frame.shape[:2]
 
-                started = time.time()
-                detections, labels = self.detector.detect(frame)
-                infer_ms = (time.time() - started) * 1000.0
+                timing: dict = {}
+                detections, labels = self.detector.detect(frame, timing=timing)
+                infer_ms = timing.get("infer_ms", 0.0)
                 raw_count = len(detections)
 
                 # Merge long-range detections (full-res coords -> fast-frame
@@ -1535,17 +2232,72 @@ class StreamWorker(threading.Thread):
                 rows = [r for r in rows if r["track_id"] not in lock_trackers]
                 rows.extend(lock_rows)
 
-                log.info(
-                    "[%s] %d raw -> %d tracked -> %d row(s) in %.0f ms",
-                    self.path,
-                    raw_count,
-                    len(detections),
-                    len(rows),
-                    infer_ms,
-                )
+                if LOG_EVERY_FRAME:
+                    log.info(
+                        "[%s] %d raw -> %d tracked -> %d row(s) in %.0f ms",
+                        self.path,
+                        raw_count,
+                        len(detections),
+                        len(rows),
+                        infer_ms,
+                    )
 
                 status.update(self.session_id, active_tracks=len(rows))
-                self.store.upsert(rows)
+                if DETECTIONS_TRANSPORT == "broadcast":
+                    # Only locks live in the table now: the UI owns the flag and
+                    # the lock poll below reads it back from there.
+                    self.store.upsert(lock_rows)
+                else:
+                    self.store.upsert(rows)
+
+                if broadcaster is not None:
+                    # Throttled to BROADCAST_MAX_HZ on average; with nothing to
+                    # show, only a keep-alive empty snapshot every
+                    # BROADCAST_IDLE_SECONDS.
+                    hz = max(0.1, BROADCAST_MAX_HZ)
+                    broadcast_budget = min(2.0, broadcast_budget + (now - budget_at) * hz)
+                    budget_at = now
+                    if not rows and last_broadcast_empty:
+                        due = now - last_broadcast >= BROADCAST_IDLE_SECONDS
+                    else:
+                        due = broadcast_budget >= 1.0
+                    if due:
+                        broadcaster.publish(
+                            self.session_id,
+                            snapshot_tracks(rows, set(lock_trackers), velocity, now),
+                        )
+                        broadcast_budget = max(0.0, broadcast_budget - 1.0)
+                        last_broadcast = now
+                        last_broadcast_empty = not rows
+
+                stats.add(
+                    frame_age_ms=(now - grabbed_at) * 1000.0,
+                    wait_ms=timing.get("wait_ms", 0.0),
+                    infer_ms=infer_ms,
+                    loop_ms=(time.time() - now) * 1000.0,
+                    tracks=len(rows),
+                )
+                if stats.due():
+                    metrics = stats.flush(
+                        range_scan_ms=scanner.last_scan_ms if scanner else None,
+                        locks=len(lock_trackers),
+                    )
+                    status.update(self.session_id, metrics=metrics)
+                    log.info(
+                        "[%s] %.1f fps | infer %.0f ms (+%.0f ms queue) | "
+                        "frame age %.0f ms | loop %.0f ms (max %.0f) | "
+                        "%.1f tracks | range scan %s ms | %d lock(s)",
+                        self.path,
+                        metrics["fps"],
+                        metrics["avg_infer_ms"],
+                        metrics["avg_queue_ms"],
+                        metrics["avg_frame_age_ms"],
+                        metrics["avg_loop_ms"],
+                        metrics["max_loop_ms"],
+                        metrics["avg_tracks"],
+                        metrics["range_scan_ms"],
+                        metrics["locks"],
+                    )
 
                 # Locks are created by the UI (on a box, or by clicking anywhere
                 # in the picture) — poll them at a low rate and start a pixel
@@ -1594,8 +2346,13 @@ class StreamWorker(threading.Thread):
 def cleanup_loop(store: DetectionStore, workers: dict[str, StreamWorker]) -> None:
     while True:
         # Sweep at least twice per TTL so boxes vanish quickly after an object
-        # leaves the frame, with a 0.4s floor to keep write volume sane.
-        time.sleep(max(0.4, TRACK_TTL_SECONDS / 2))
+        # leaves the frame, with a 0.4s floor to keep write volume sane. In
+        # broadcast mode the table only holds locks (5 s grace), so a slow
+        # sweep is enough and saves ~4 DELETEs per second.
+        if DETECTIONS_TRANSPORT == "broadcast":
+            time.sleep(2.0)
+        else:
+            time.sleep(max(0.4, TRACK_TTL_SECONDS / 2))
         store.prune(list(workers.keys()))
 
 
@@ -1656,6 +2413,7 @@ def main() -> None:
     start_health_server()
 
     detector = YoloDetector()
+    status.model = detector.model_path
     log.info("Detector config: %s", detector.describe())
     log.info(
         "Auto-discovery every %.0fs from %s (max %d stream(s))",

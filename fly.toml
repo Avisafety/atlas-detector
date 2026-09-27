@@ -49,7 +49,8 @@ primary_region = "ams"
   DETECTION_CONFIDENCE = "0.20"
   # Longest side used for the fast pass — balances speed and range.
   INFER_MAX_SIDE = "640"
-  # Analysed frames a lost track survives inside ByteTrack.
+  # Analysed frames a lost track survives inside ByteTrack (now exact; at
+  # ~20 fps this is 0.25 s, the same wall time as before the speed-up).
   TRACKER_LOST_BUFFER = "5"
   # Boxes disappear fast when an object leaves the frame.
   TRACK_TTL_SECONDS = "0.2"
@@ -71,6 +72,20 @@ primary_region = "ams"
   RANGE_RESULT_MAX_AGE_SECONDS = "0"
   # Temporary: set to "true" to log per-source counts and each suppression.
   RANGE_DEBUG = "false"
+
+  # How boxes reach the browser: "both" during the transition (Broadcast +
+  # atlas_detections), then "broadcast" (only locked tracks in the table).
+  # "postgres" is the old behaviour and the instant rollback.
+  DETECTIONS_TRANSPORT = "broadcast"
+  # Broadcast snapshots per second per stream (frontend glides boxes with
+  # vx/vy in between). Keeps Realtime's messages/s quota comfortable.
+  BROADCAST_MAX_HZ = "10"
+
+  # Logging: one summary line per stream every 10 s. OpenCV's own warnings
+  # (e.g. "can't be used to capture by name" after every failed RTSP open)
+  # are noise next to the detector's "stream error" line.
+  LOG_SUMMARY_SECONDS = "10"
+  OPENCV_LOG_LEVEL = "ERROR"
 
 [[vm]]
   # Dedicated CPU — on shared CPU the machine, not the code, caps the frame rate.
