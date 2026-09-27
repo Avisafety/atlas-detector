@@ -2032,6 +2032,11 @@ class StreamWorker(threading.Thread):
         broadcaster = self.store.broadcaster
         last_broadcast = 0.0
         last_broadcast_empty = False
+        # Token bucket for BROADCAST_MAX_HZ: frames arrive with jitter, and a
+        # plain "at least 1/hz since the last send" check skipped every other
+        # frame whenever a frame came a few ms early (10 fps gave ~5 msg/s).
+        broadcast_budget = 1.0
+        budget_at = 0.0
 
         # Latest full-resolution frame, shared with the background scanners.
         full_frame_slot: dict = {"frame": None, "seq": -1}
@@ -2246,18 +2251,22 @@ class StreamWorker(threading.Thread):
                     self.store.upsert(rows)
 
                 if broadcaster is not None:
-                    # Throttled to BROADCAST_MAX_HZ; with nothing to show, only
-                    # a keep-alive empty snapshot every BROADCAST_IDLE_SECONDS.
-                    interval = (
-                        BROADCAST_IDLE_SECONDS
-                        if not rows and last_broadcast_empty
-                        else 1.0 / max(0.1, BROADCAST_MAX_HZ)
-                    )
-                    if now - last_broadcast >= interval:
+                    # Throttled to BROADCAST_MAX_HZ on average; with nothing to
+                    # show, only a keep-alive empty snapshot every
+                    # BROADCAST_IDLE_SECONDS.
+                    hz = max(0.1, BROADCAST_MAX_HZ)
+                    broadcast_budget = min(2.0, broadcast_budget + (now - budget_at) * hz)
+                    budget_at = now
+                    if not rows and last_broadcast_empty:
+                        due = now - last_broadcast >= BROADCAST_IDLE_SECONDS
+                    else:
+                        due = broadcast_budget >= 1.0
+                    if due:
                         broadcaster.publish(
                             self.session_id,
                             snapshot_tracks(rows, set(lock_trackers), velocity, now),
                         )
+                        broadcast_budget = max(0.0, broadcast_budget - 1.0)
                         last_broadcast = now
                         last_broadcast_empty = not rows
 
@@ -2337,8 +2346,13 @@ class StreamWorker(threading.Thread):
 def cleanup_loop(store: DetectionStore, workers: dict[str, StreamWorker]) -> None:
     while True:
         # Sweep at least twice per TTL so boxes vanish quickly after an object
-        # leaves the frame, with a 0.4s floor to keep write volume sane.
-        time.sleep(max(0.4, TRACK_TTL_SECONDS / 2))
+        # leaves the frame, with a 0.4s floor to keep write volume sane. In
+        # broadcast mode the table only holds locks (5 s grace), so a slow
+        # sweep is enough and saves ~4 DELETEs per second.
+        if DETECTIONS_TRANSPORT == "broadcast":
+            time.sleep(2.0)
+        else:
+            time.sleep(max(0.4, TRACK_TTL_SECONDS / 2))
         store.prune(list(workers.keys()))
 
 

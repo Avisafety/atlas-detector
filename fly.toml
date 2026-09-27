@@ -76,7 +76,7 @@ primary_region = "ams"
   # How boxes reach the browser: "both" during the transition (Broadcast +
   # atlas_detections), then "broadcast" (only locked tracks in the table).
   # "postgres" is the old behaviour and the instant rollback.
-  DETECTIONS_TRANSPORT = "both"
+  DETECTIONS_TRANSPORT = "broadcast"
   # Broadcast snapshots per second per stream (frontend glides boxes with
   # vx/vy in between). Keeps Realtime's messages/s quota comfortable.
   BROADCAST_MAX_HZ = "10"
