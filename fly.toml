@@ -57,6 +57,9 @@ primary_region = "ams"
   DETECTION_CONFIDENCE = "0.20"
   # Longest side used for the fast pass — balances speed and range.
   INFER_MAX_SIDE = "640"
+  # BoT-SORT with background-only camera-motion compensation ("bytetrack" =
+  # previous tracker, instant rollback).
+  TRACKER_IMPL = "botsort"
   # Analysed frames a lost track survives inside ByteTrack (now exact; at
   # ~20 fps this is 0.25 s, the same wall time as before the speed-up).
   TRACKER_LOST_BUFFER = "5"

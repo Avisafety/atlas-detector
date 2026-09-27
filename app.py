@@ -57,6 +57,7 @@ CPU only. Everything is configured through environment variables:
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
 import os
@@ -204,6 +205,42 @@ LOCK_MATCH_IOU = float(os.environ.get("LOCK_MATCH_IOU", "0.3") or 0.3)
 # How long the lock survives with neither pixel tracking nor a detection before
 # it is released and the UI clears it.
 LOCK_GRACE_SECONDS = float(os.environ.get("LOCK_GRACE_SECONDS", "4.0") or 4.0)
+# A matched detection only re-initialises the lock's pixel tracker when the two
+# boxes have drifted apart (IoU below this). Re-initialising CSRT on every
+# matched frame cost ~25 ms per lock per frame.
+LOCK_REINIT_IOU = float(os.environ.get("LOCK_REINIT_IOU", "0.6") or 0.6)
+
+# --- Tracker ---------------------------------------------------------------- #
+# botsort   — Ultralytics BoT-SORT with global motion compensation: the camera
+#             movement between frames (drone flying, gimbal panning) is
+#             estimated with sparse optical flow and removed from every track's
+#             predicted position before matching, so a pan no longer breaks
+#             tracks into new ids. New tracks must be seen on two consecutive
+#             frames before they are shown.
+# bytetrack — the previous supervision ByteTrack (rollback).
+TRACKER_IMPL = os.environ.get("TRACKER_IMPL", "botsort").strip().lower()
+# Detections at or above this start and extend tracks directly ...
+TRACK_HIGH_THRESH = float(os.environ.get("TRACK_HIGH_THRESH", "0.25") or 0.25)
+# ... detections between LOW and HIGH may only extend an existing track (the
+# ByteTrack idea: weak detections keep occluded/distant objects alive).
+TRACK_LOW_THRESH = float(os.environ.get("TRACK_LOW_THRESH", "0.10") or 0.10)
+# Minimum score for an unmatched detection to open a new track.
+NEW_TRACK_THRESH = float(os.environ.get("NEW_TRACK_THRESH", "0.25") or 0.25)
+TRACK_MATCH_THRESH = float(os.environ.get("TRACK_MATCH_THRESH", "0.8") or 0.8)
+# Motion compensation method: maskedFlow (ours, default) | sparseOptFlow | orb
+# | ecc | none. maskedFlow is sparse optical flow on the BACKGROUND only.
+TRACKER_GMC = os.environ.get("TRACKER_GMC", "maskedFlow").strip()
+# The published class of a track is a confidence-weighted vote over its last
+# N detections, so one object no longer flips car -> truck -> car.
+CLASS_VOTE_WINDOW = int(os.environ.get("CLASS_VOTE_WINDOW", "10") or 10)
+# A new range / motion result may open tracks on this many consecutive frames
+# (a new track needs two to be confirmed); later re-fed copies only extend.
+NEW_RESULT_FRAMES = 2
+# The range pass exists for SMALL, distant objects; anything larger than this
+# (longest side, px in the fast-pass frame) is found by the fast pass itself, so
+# a range box that big may extend a track but never open a second one on the
+# same object.
+RANGE_NEW_TRACK_MAX_SIDE = float(os.environ.get("RANGE_NEW_TRACK_MAX_SIDE", "64") or 64)
 
 # Classes YOLO regularly swaps between on the same object. Treated as one class
 # during duplicate suppression, so a car does not also get a truck box.
@@ -341,6 +378,7 @@ class Status:
                 "model": self.model,
                 "db_writer": self.writer,
                 "transport": DETECTIONS_TRANSPORT,
+                "tracker": TRACKER_IMPL,
                 "broadcast": self.broadcast,
                 "detection_fps": DETECTION_FPS,
                 "confidence": DETECTION_CONFIDENCE,
@@ -1359,6 +1397,27 @@ def tile_offsets(width: int, height: int, cols: int, rows: int, overlap: float):
             yield x0, y0, min(width, x0 + tile_w), min(height, y0 + tile_h)
 
 
+IDENTITY_WARP = np.eye(2, 3, dtype=np.float32)
+
+
+def compose_warp(later: np.ndarray, earlier: np.ndarray) -> np.ndarray:
+    """2x3 affine for "earlier, then later"."""
+    a = np.vstack([later, [0.0, 0.0, 1.0]])
+    b = np.vstack([earlier, [0.0, 0.0, 1.0]])
+    return (a @ b)[:2].astype(np.float32)
+
+
+def warp_boxes(xyxy: np.ndarray, warp: np.ndarray) -> np.ndarray:
+    """Move xyxy boxes by a (similarity) affine; axis-aligned result."""
+    if len(xyxy) == 0:
+        return xyxy
+    pts = np.concatenate([xyxy[:, :2], xyxy[:, 2:]], axis=0)
+    moved = pts @ warp[:, :2].T + warp[:, 2]
+    n = len(xyxy)
+    p1, p2 = moved[:n], moved[n:]
+    return np.concatenate([np.minimum(p1, p2), np.maximum(p1, p2)], axis=1).astype(np.float32)
+
+
 def iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Pairwise IoU between xyxy box arrays a (n) and b (m) -> (n, m)."""
     if len(a) == 0 or len(b) == 0:
@@ -1422,6 +1481,15 @@ def merge_source(detections, labels, extra, extra_labels, scale: float):
     return merged, list(labels) + list(extra_labels)
 
 
+def with_sources(detections, sources: list[str]):
+    """Tag every box with where it came from (fast / range_new / range_old /
+    motion_new / motion_old); survives dedupe and filtering (sv.Detections
+    slices data arrays)."""
+    detections.data = dict(detections.data or {})
+    detections.data["src"] = np.array(sources, dtype=object)
+    return detections
+
+
 def dedupe_class_aware(detections, labels: list[str], iou_thr: float | None = None):
     """Keep the highest-confidence box per physical object, per class.
 
@@ -1440,7 +1508,15 @@ def dedupe_class_aware(detections, labels: list[str], iou_thr: float | None = No
     # motion candidate must always lose against a real class on the same
     # object, never the other way around.
     unknown = np.array([1 if l == UNKNOWN_CLASS else 0 for l in labels])
-    order = np.lexsort((-np.asarray(confidence, dtype=float), unknown))
+    # Re-fed copies of an older range/motion result describe where an object
+    # WAS; on the same object a fresh detection must win whatever its score.
+    src = (detections.data or {}).get("src")
+    stale = (
+        np.array([1 if str(x).endswith("_old") else 0 for x in src])
+        if src is not None and len(src) == len(labels)
+        else np.zeros(len(labels), dtype=int)
+    )
+    order = np.lexsort((-np.asarray(confidence, dtype=float), stale, unknown))
     keep: list[int] = []
     boxes = detections.xyxy
     for idx in order:
@@ -1899,12 +1975,17 @@ class LockTracker:
         return True
 
     def correct(self, frame, box, label: str, confidence: float) -> None:
-        """Snap to a detector box and restart pixel tracking from there."""
-        self.box = np.asarray(box, dtype=float)
+        """Take class/confidence from a matching detector box; re-anchor the
+        pixel tracker on it only when the two have drifted apart."""
+        box = np.asarray(box, dtype=float)
         self.last_seen = time.time()
         if label:
             self.label = label
         self.confidence = float(confidence or 0.0)
+        drift_iou = float(iou_matrix(self.box.reshape(1, 4), box.reshape(1, 4))[0, 0])
+        if self.impl is not None and drift_iou >= LOCK_REINIT_IOU:
+            return
+        self.box = box
         self._init_impl(frame)
 
 
@@ -1941,6 +2022,250 @@ def lock_row(
 # --------------------------------------------------------------------------- #
 # One worker per live stream
 # --------------------------------------------------------------------------- #
+
+
+class _TrackerInput:
+    """The minimal Results-like view Ultralytics trackers read (boolean
+    indexing plus xyxy / xywh / conf / cls)."""
+
+    def __init__(self, xyxy, conf, cls) -> None:
+        self.xyxy = np.asarray(xyxy, dtype=np.float32).reshape(-1, 4)
+        self.conf = np.asarray(conf, dtype=np.float32).reshape(-1)
+        self.cls = np.asarray(cls, dtype=np.float32).reshape(-1)
+        x1, y1, x2, y2 = self.xyxy.T
+        self.xywh = np.stack([(x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1], axis=1)
+
+    def __len__(self) -> int:
+        return len(self.conf)
+
+    def __getitem__(self, idx) -> "_TrackerInput":
+        return _TrackerInput(self.xyxy[idx], self.conf[idx], self.cls[idx])
+
+
+class MaskedFlowGMC:
+    """Camera motion between consecutive frames, from the background only.
+
+    Ultralytics' sparseOptFlow picks corners anywhere — including on a large
+    moving object — and then reports that object's motion as camera motion,
+    which shifts every track the wrong way (measured: static camera, one big
+    moving person -> 12-24 px phantom pans and ~5x more track ids). Here
+    detected boxes (padded) and the frame border are masked out before corners
+    are chosen, and when too few background points agree (open sea, fog,
+    blur) no compensation is applied at all rather than a bad one.
+
+    Interface matches what Ultralytics' BYTETracker expects from `self.gmc`.
+    """
+
+    method = "maskedFlow"
+    MIN_POINTS = 12
+    MIN_INLIER_RATIO = 0.35
+
+    # 640x360 fast frame -> 160x90: ~3 ms per frame worst case, mean error
+    # ~0.1 px on a synthetic pan (2x/400 corners cost ~9-23 ms for 0.05 px).
+    def __init__(self, downscale: int = 4) -> None:
+        self.downscale = max(1, downscale)
+        self._prev = None
+        self._prev_pts = None
+        self.last_ok = False
+        self.last_H = IDENTITY_WARP
+
+    def reset_params(self) -> None:
+        self._prev = None
+        self._prev_pts = None
+
+    def _mask(self, shape, detections) -> np.ndarray:
+        h, w = shape
+        mask = np.zeros((h, w), dtype=np.uint8)
+        mask[int(0.03 * h): int(0.97 * h), int(0.03 * w): int(0.97 * w)] = 255
+        if detections is not None:
+            for det in np.asarray(detections, dtype=float).reshape(-1, 4):
+                x1, y1, x2, y2 = det / self.downscale
+                pw, ph = (x2 - x1) * 0.15, (y2 - y1) * 0.15
+                mask[
+                    max(0, int(y1 - ph)): max(0, int(y2 + ph)),
+                    max(0, int(x1 - pw)): max(0, int(x2 + pw)),
+                ] = 0
+        return mask
+
+    def apply(self, raw_frame, detections=None) -> np.ndarray:
+        H = np.eye(2, 3, dtype=np.float32)
+        gray = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2GRAY)
+        if self.downscale > 1:
+            h0, w0 = gray.shape
+            gray = cv2.resize(gray, (w0 // self.downscale, h0 // self.downscale))
+        self.last_ok = False
+        if self._prev is not None and self._prev_pts is not None and len(self._prev_pts) >= self.MIN_POINTS:
+            curr, status, _ = cv2.calcOpticalFlowPyrLK(self._prev, gray, self._prev_pts, None)
+            good = status.reshape(-1) == 1
+            if int(good.sum()) >= self.MIN_POINTS:
+                M, inliers = cv2.estimateAffinePartial2D(
+                    self._prev_pts[good], curr[good], method=cv2.RANSAC, ransacReprojThreshold=3.0
+                )
+                if (
+                    M is not None
+                    and inliers is not None
+                    and int(inliers.sum()) >= max(self.MIN_POINTS, self.MIN_INLIER_RATIO * int(good.sum()))
+                ):
+                    H = M.astype(np.float32)
+                    H[:, 2] *= self.downscale
+                    self.last_ok = True
+        self.last_H = H
+        self._prev = gray
+        self._prev_pts = cv2.goodFeaturesToTrack(
+            gray, maxCorners=150, qualityLevel=0.01, minDistance=3,
+            mask=self._mask(gray.shape, detections),
+        )
+        return H
+
+
+def _botsort_class():
+    from ultralytics.trackers.bot_sort import BOTSORT
+
+    class StreamBOTSORT(BOTSORT):
+        """BoT-SORT that never resets the track-id counter.
+
+        Ultralytics keeps one class-level id counter and resets it whenever a
+        tracker is constructed. With several streams (or one stream
+        reconnecting) that would hand out ids a running stream still uses. Ids
+        simply keep counting up for the life of the process instead.
+        """
+
+        @staticmethod
+        def reset_id() -> None:
+            return None
+
+    return StreamBOTSORT
+
+
+class StreamTracker:
+    """One tracker per stream: detections in, tracked detections out.
+
+    Output is an sv.Detections with tracker_id, the detection's own confidence
+    and data["label"] holding the voted class — exactly what build_rows needs.
+    """
+
+    def __init__(self) -> None:
+        self._votes: dict[int, dict] = {}
+        self._label_ids: dict[str, int] = {}
+        self._frame = 0
+        self.impl = TRACKER_IMPL if TRACKER_IMPL in ("botsort", "bytetrack") else "botsort"
+        if self.impl == "bytetrack":
+            # Previous behaviour, kept as a rollback (TRACKER_IMPL=bytetrack).
+            self._sv = sv.ByteTrack(
+                lost_track_buffer=TRACKER_LOST_BUFFER,
+                frame_rate=30,  # makes the buffer exactly TRACKER_LOST_BUFFER frames
+                track_activation_threshold=min(
+                    0.25,
+                    DETECTION_CONFIDENCE,
+                    MOTION_CONFIDENCE if MOTION_PASS_ENABLED else 1.0,
+                ),
+            )
+            self._bot = None
+            return
+        from types import SimpleNamespace
+
+        self._sv = None
+        self._bot = _botsort_class()(
+            SimpleNamespace(
+                tracker_type="botsort",
+                track_high_thresh=TRACK_HIGH_THRESH,
+                track_low_thresh=TRACK_LOW_THRESH,
+                new_track_thresh=NEW_TRACK_THRESH,
+                track_buffer=TRACKER_LOST_BUFFER,  # frames, not scaled
+                match_thresh=TRACK_MATCH_THRESH,
+                fuse_score=True,
+                gmc_method=(
+                    None if TRACKER_GMC.lower() in ("none", "maskedflow") else TRACKER_GMC
+                ),
+                proximity_thresh=0.5,
+                appearance_thresh=0.8,
+                with_reid=False,
+                model="auto",
+            )
+        )
+        if TRACKER_GMC.lower() == "maskedflow":
+            self._bot.gmc = MaskedFlowGMC()
+
+    def update(self, detections, labels: list[str], frame):
+        """Advance one analysed frame. `frame` is the image the boxes live in
+        (needed for motion compensation)."""
+        if self._bot is None:
+            return self._sv.update_with_detections(attach_labels(detections, labels))
+
+        self._frame += 1
+        n = len(detections)
+        conf = (
+            np.asarray(detections.confidence, dtype=np.float32)
+            if detections.confidence is not None and n
+            else np.zeros(n, dtype=np.float32)
+        )
+        feed = conf.copy()
+        if n:
+            src = (detections.data or {}).get("src")
+            src = list(src) if src is not None and len(src) == n else [""] * n
+            unknown = np.array([label == UNKNOWN_CLASS for label in labels], dtype=bool)
+            stale = np.array([str(x).endswith("_old") for x in src], dtype=bool)
+            sides = np.maximum(
+                detections.xyxy[:, 2] - detections.xyxy[:, 0],
+                detections.xyxy[:, 3] - detections.xyxy[:, 1],
+            )
+            big_range = np.array([x == "range_new" for x in src], dtype=bool) & (
+                sides > RANGE_NEW_TRACK_MAX_SIDE
+            )
+            stale = stale | big_range
+            # Confirmed motion candidates carry a deliberately low confidence
+            # for display; a fresh one may still open a track.
+            bump = unknown & ~stale
+            feed[bump] = np.maximum(feed[bump], NEW_TRACK_THRESH)
+            # Re-fed copies may only extend a track (low band), never open one.
+            feed[stale] = np.minimum(feed[stale], max(TRACK_LOW_THRESH + 0.01, TRACK_HIGH_THRESH - 0.01))
+        cls = [self._label_ids.setdefault(label, len(self._label_ids)) for label in labels]
+        out = self._bot.update(
+            _TrackerInput(detections.xyxy if n else np.zeros((0, 4)), feed, cls), frame
+        )
+
+        if out is None or len(out) == 0:
+            self._prune()
+            return sv.Detections.empty()
+        out = np.asarray(out, dtype=np.float64)
+        idx = out[:, 7].astype(int)
+        tids = out[:, 4].astype(int)
+        voted = [self._vote(int(t), labels[i], float(conf[i])) for t, i in zip(tids, idx)]
+        tracked = sv.Detections(
+            xyxy=out[:, :4].astype(np.float32),
+            confidence=conf[idx],
+            tracker_id=tids,
+        )
+        self._prune()
+        return attach_labels(tracked, voted)
+
+    def last_warp(self) -> np.ndarray:
+        """Camera motion measured on the last update (identity if unknown)."""
+        gmc = getattr(self._bot, "gmc", None) if self._bot is not None else None
+        warp = getattr(gmc, "last_H", None)
+        return warp if warp is not None else IDENTITY_WARP
+
+    def _vote(self, track_id: int, label: str, confidence: float) -> str:
+        entry = self._votes.get(track_id)
+        if entry is None:
+            entry = self._votes[track_id] = {
+                "hist": collections.deque(maxlen=max(1, CLASS_VOTE_WINDOW)),
+                "seen": self._frame,
+            }
+        entry["hist"].append((label, confidence))
+        entry["seen"] = self._frame
+        scores: dict[str, float] = {}
+        for lab, c in entry["hist"]:
+            if lab and lab != UNKNOWN_CLASS:
+                scores[lab] = scores.get(lab, 0.0) + max(c, 0.01)
+        return max(scores, key=scores.get) if scores else UNKNOWN_CLASS
+
+    def _prune(self) -> None:
+        if self._frame % 50:
+            return
+        stale = [t for t, e in self._votes.items() if self._frame - e["seen"] > 300]
+        for t in stale:
+            self._votes.pop(t, None)
 
 
 class StreamStats:
@@ -2049,22 +2374,15 @@ class StreamWorker(threading.Thread):
         status.update(self.session_id, connected=True)
         log.info("[%s] connected", self.path)
 
-        # Fast-reacting tracker with a short memory for lost tracks.
-        # supervision scales the buffer by frame_rate / 30, so frame_rate=30
-        # makes TRACKER_LOST_BUFFER mean exactly "analysed frames a lost track
-        # survives", as documented. (Passing DETECTION_FPS=20 silently cut a
-        # buffer of 5 down to 3 frames.)
-        tracker = sv.ByteTrack(
-            lost_track_buffer=TRACKER_LOST_BUFFER,
-            frame_rate=30,
-            # Motion candidates carry a deliberately low, fixed confidence —
-            # the tracker must still be allowed to open a track for them.
-            track_activation_threshold=min(
-                0.25,
-                DETECTION_CONFIDENCE,
-                MOTION_CONFIDENCE if MOTION_PASS_ENABLED else 1.0,
-            ),
-        )
+        # One tracker per connection (BoT-SORT with motion compensation by
+        # default, see StreamTracker).
+        tracker = StreamTracker()
+        # Camera motion since the current range / motion result was produced,
+        # used to move its re-fed copies along with the scene.
+        motion_compensated = tracker.impl == "botsort"
+        range_fed_at = motion_fed_at = -1.0
+        range_warp = motion_warp = IDENTITY_WARP
+        range_new_left = motion_new_left = 0
         grabber = FrameGrabber(cap)
         last_seq = 0
         last_inference = 0.0
@@ -2152,14 +2470,37 @@ class StreamWorker(threading.Thread):
                 # Stale range results are skipped: their coordinates describe
                 # where the object was, and feeding them spawns a ghost track.
                 range_count = 0
+                sources = ["fast"] * len(detections)
                 if scanner is not None:
                     range_dets, range_labels, range_at = scanner.latest()
                     fresh = (now - range_at) <= RANGE_RESULT_MAX_AGE_SECONDS
                     if range_dets is not None and len(range_dets) > 0 and fresh:
                         range_count = len(range_dets)
+                        range_boxes = range_dets.xyxy * scale
+                        if motion_compensated:
+                            # A range result may open tracks only the first
+                            # time it is fed. Later copies are moved along with
+                            # the camera since then and may only keep an
+                            # existing track alive (see StreamTracker).
+                            if range_at != range_fed_at:
+                                range_fed_at, range_warp = range_at, IDENTITY_WARP
+                                range_new_left = NEW_RESULT_FRAMES
+                            if range_new_left > 0:
+                                # New tracks need two consecutive frames to be
+                                # confirmed, so a result may open tracks on its
+                                # first NEW_RESULT_FRAMES frames.
+                                range_new_left -= 1
+                                range_src = "range_new"
+                            else:
+                                range_src = "range_old"
+                            if range_warp is not IDENTITY_WARP:
+                                range_boxes = warp_boxes(range_boxes, range_warp)
+                        else:
+                            range_src = "range_new"
+                        sources += [range_src] * range_count
                         detections = sv.Detections(
                             xyxy=np.concatenate(
-                                [detections.xyxy, range_dets.xyxy * scale]
+                                [detections.xyxy, range_boxes]
                             ),
                             confidence=np.concatenate(
                                 [
@@ -2185,6 +2526,21 @@ class StreamWorker(threading.Thread):
                     fresh = (now - motion_at) <= MOTION_RESULT_MAX_AGE_SECONDS
                     if motion_dets is not None and len(motion_dets) > 0 and fresh:
                         motion_count = len(motion_dets)
+                        motion_src = "motion_new"
+                        if motion_compensated:
+                            if motion_at != motion_fed_at:
+                                motion_fed_at, motion_warp = motion_at, IDENTITY_WARP
+                                motion_new_left = NEW_RESULT_FRAMES
+                            if motion_new_left > 0:
+                                motion_new_left -= 1
+                            else:
+                                motion_src = "motion_old"
+                            if motion_warp is not IDENTITY_WARP:
+                                motion_dets = sv.Detections(
+                                    xyxy=warp_boxes(motion_dets.xyxy * scale, motion_warp) / scale,
+                                    confidence=motion_dets.confidence,
+                                )
+                        sources += [motion_src] * motion_count
                         detections, labels = merge_source(
                             detections,
                             labels,
@@ -2194,6 +2550,7 @@ class StreamWorker(threading.Thread):
                         )
 
                 merged_count = len(detections)
+                detections = with_sources(detections, sources)
                 detections, labels = dedupe_class_aware(detections, labels)
 
                 # ---- Locked objects ---------------------------------------- #
@@ -2266,9 +2623,11 @@ class StreamWorker(threading.Thread):
                         len(detections),
                     )
 
-                detections = tracker.update_with_detections(
-                    attach_labels(detections, labels)
-                )
+                detections = tracker.update(detections, labels, frame)
+                if motion_compensated:
+                    step = tracker.last_warp()
+                    range_warp = compose_warp(step, range_warp)
+                    motion_warp = compose_warp(step, motion_warp)
                 rows = build_rows(detections, self.session_id, width, height)
                 rows = [r for r in rows if r["track_id"] not in lock_trackers]
                 rows.extend(lock_rows)
